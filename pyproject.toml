@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-dspine"
+version = "0.1.0"
+description = "DSpine speculative decoding for SGLang, as an SGLang plugin"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["License.txt"]
+requires-python = ">=3.10"
+# Built and tested against this exact release: the plugin subclasses SGLang internals.
+dependencies = ["sglang==0.5.20"]
+
+[project.optional-dependencies]
+test = ["pytest", "scipy"]
+
+[project.entry-points."sglang.srt.plugins"]
+dspine = "sglang_dspine.plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["sglang_dspine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.isort]
+profile = "black"
+known_first_party = ["sglang_dspine"]
+known_local_folder = ["ref_utils"]
