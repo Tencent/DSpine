@@ -4,3 +4,20 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+.venv/
+.DS_Store
+*.swp
+*.swo
+.ssh/
+.venv*/
+checkpoints/
+
+# Local-only MLX development files (not part of the release)
+/dspine_mlx/data/
+/dspine_mlx/tests/
+/dspine_mlx/scripts/
+/dspine_mlx/results/
+/dspine_mlx/comparison_dflash.md
+/dspine_mlx/dspine_mlx/bench.py
+/dspine_mlx/dspine_mlx/sglang/bench_concurrency.py
+/scripts/

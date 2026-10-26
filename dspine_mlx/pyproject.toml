@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dspine-mlx"
+version = "0.1.0"
+description = "DSpine speculative decoding for Apple MLX, including single-stream generation and an SGLang-MLX serving plugin"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.32",
+    "mlx-lm>=0.32",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+# SGLang 0.5.18 has no macOS wheel; build it from source first (see README).
+sglang = ["sglang==0.5.18"]
+
+[project.scripts]
+dspine-generate = "dspine_mlx.generate:main"
+
+[project.entry-points."sglang.srt.plugins"]
+dspine_mlx = "dspine_mlx.sglang.plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["dspine_mlx*"]
+
+[tool.isort]
+profile = "black"
+known_first_party = ["dspine_mlx"]

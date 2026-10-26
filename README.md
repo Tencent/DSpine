@@ -21,6 +21,7 @@ parallel.
 
 ## News
 
+- **[2026-10]** Support for `mlx-lm` inference and SGLang-MLX on Apple Silicon.
 - **[2026-10]** Inference code and model weights released.
 - **[2026-09]** Paper released on [arXiv](https://arxiv.org/abs/2609.36173).
 
@@ -83,6 +84,15 @@ sglang serve \
   --cuda-graph-bs-decode 1 2 4 8 16 32 64 \
   --trust-remote-code
 ```
+
+## Apple Silicon (MLX)
+
+The `dspine_mlx/` directory is the single MLX package for Apple Silicon. It provides
+both a single-stream MLX implementation and, through the optional `sglang` extra, an
+SGLang MLX serving plugin (`SGLANG_USE_MLX=1`). Install it with
+`pip install -e dspine_mlx`; see [dspine_mlx/README.md](dspine_mlx/README.md) for
+install, usage and results. The MLX plugin is independent of the SGLang 0.5.20 CUDA
+plugin in `sglang_dspine/`.
 
 ## Roadmap
 
