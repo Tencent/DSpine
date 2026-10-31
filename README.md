@@ -21,9 +21,11 @@ parallel.
 
 ## News
 
-- **[2026-10]** Support for `mlx-lm` inference and SGLang-MLX on Apple Silicon.
-- **[2026-10]** Inference code and model weights released.
-- **[2026-09]** Paper released on [arXiv](https://arxiv.org/abs/2609.36173).
+- **[2026-11]** 🍎 Apple Silicon inference: mlx-lm & SGLang-MLX.
+- **[2026-10]** 🚀 [Training code](https://github.com/sgl-project/SpecForge/pull/1038) released in SpecForge.
+- **[2026-10]** 🤗 [Qwen3-8B draft weights](https://huggingface.co/tencent/Qwen3-8B-DSpine-b16) released.
+- **[2026-10]** 💻 [Inference code](https://github.com/tencent/dspine) released.
+- **[2026-10]** 📄 [Paper](https://arxiv.org/abs/2609.36173) released on arXiv.
 
 ## Supported Models
 
