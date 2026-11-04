@@ -96,6 +96,10 @@ SGLang MLX serving plugin (`SGLANG_USE_MLX=1`). Install it with
 install, usage and results. The MLX plugin is independent of the SGLang 0.5.20 CUDA
 plugin in `sglang_dspine/`.
 
+## Training
+
+To train DSpine, follow the [SpecForge training guide](https://github.com/sgl-project/SpecForge/blob/main/docs/sections/basic_usage/training.md). See [SpecForge PR #1038](https://github.com/sgl-project/SpecForge/pull/1038) for the DSpine training corrections and an online training example.
+
 ## Roadmap
 
 - [ ] Training code for DSpine
