@@ -1,8 +1,4 @@
-"""Run DSpine's eager sampled refinement after draft CUDA-graph replay.
-
-Sampled rounds must update ``out`` before DFlashWorkerV2 reads the proposal.
-The plugin selects this runner only for the DSPINE draft model.
-"""
+"""DSpine serving on SGLang 0.5.22."""
 
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,

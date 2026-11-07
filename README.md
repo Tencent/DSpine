@@ -21,7 +21,8 @@ parallel.
 
 ## News
 
-- **[2026-11]** 🍎 Apple Silicon inference: mlx-lm & SGLang-MLX.
+- **[2026-11]** Added support for Qwen3.8-27B inference.
+- **[2026-11]** 🍎 Added support for Apple Silicon inference via mlx-lm and SGLang-MLX.
 - **[2026-10]** 🚀 [Training code](https://github.com/sgl-project/SpecForge/pull/1038) released in SpecForge.
 - **[2026-10]** 🤗 [Qwen3-8B draft weights](https://huggingface.co/tencent/Qwen3-8B-DSpine-b16) released.
 - **[2026-10]** 💻 [Inference code](https://github.com/tencent/dspine) released.
@@ -32,7 +33,7 @@ parallel.
 | Target model | Draft model |
 | --- | --- |
 | `Qwen3-8B` | [tencent/Qwen3-8B-DSpine-b16](https://huggingface.co/tencent/Qwen3-8B-DSpine-b16) |
-| `Qwen3.8-27B` | Coming soon |
+| `Qwen3.8-27B` | [tencent/Qwen3.8-27B-DSpine-b16](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) |
 
 ## Results
 
@@ -57,7 +58,7 @@ Acceptance length on Qwen3-8B. DSpine, DSpark and DFlash2 are all retrained on
 
 ## Installation
 
-Use Python 3.10 or later with CUDA. The command below installs DSpine and SGLang 0.5.20.
+Requires Python 3.11+ and CUDA. Installation includes SGLang 0.5.22.
 
 ```bash
 git clone https://github.com/tencent/dspine.git
@@ -67,8 +68,7 @@ python -m pip install -e .
 
 ## Usage
 
-The following example serves a DSpine draft with Qwen3-8B using the
-[tencent/Qwen3-8B-DSpine-b16](https://huggingface.co/tencent/Qwen3-8B-DSpine-b16) checkpoint.
+Serve Qwen3-8B:
 
 ```bash
 sglang serve \
@@ -87,23 +87,59 @@ sglang serve \
   --trust-remote-code
 ```
 
+### Qwen3.8-27B
+
+Single GPU, up to eight concurrent requests. The draft uses block size 16 and an
+8K sliding window.
+
+Uses [DSpark](https://github.com/deepseek-ai/DeepSpec)-based dynamic verification
+and [ReplaySSM](https://github.com/Johnny-Liou/ReplaySSM).
+
+Run [SPS tuning](docs/sps_tuning.md) to choose verification budgets for your GPU
+and workload. Load the result with `--speculative-dspark-sps-table-path sps.json`;
+the default is verify16.
+
+```bash
+sglang serve \
+  --model-path /path/to/Qwen3.8-27B \
+  --speculative-algorithm DSPINE \
+  --speculative-draft-model-path tencent/Qwen3.8-27B-DSpine-b16 \
+  --speculative-num-draft-tokens 16 \
+  --tp-size 1 \
+  --dtype bfloat16 \
+  --attention-backend fa3 \
+  --speculative-draft-attention-backend fa3 \
+  --linear-attn-backend triton \
+  --enable-linear-replayssm-spec \
+  --mamba-ssm-dtype float32 \
+  --mamba-radix-cache-strategy extra_buffer \
+  --max-mamba-cache-size 64 \
+  --mem-fraction-static 0.80 \
+  --context-length 131072 \
+  --max-running-requests 8 \
+  --cuda-graph-max-bs-decode 8 \
+  --min-free-slots-delay 1 \
+  --sampling-backend flashinfer \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --trust-remote-code
+```
+
 ## Apple Silicon (MLX)
 
-The `dspine_mlx/` directory is the single MLX package for Apple Silicon. It provides
-both a single-stream MLX implementation and, through the optional `sglang` extra, an
-SGLang MLX serving plugin (`SGLANG_USE_MLX=1`). Install it with
-`pip install -e dspine_mlx`; see [dspine_mlx/README.md](dspine_mlx/README.md) for
-install, usage and results. The MLX plugin is independent of the SGLang 0.5.20 CUDA
-plugin in `sglang_dspine/`.
+Install with `pip install -e dspine_mlx`. See the [MLX guide](dspine_mlx/README.md)
+for mlx-lm and SGLang-MLX usage.
 
 ## Training
 
-To train DSpine, follow the [SpecForge training guide](https://github.com/sgl-project/SpecForge/blob/main/docs/sections/basic_usage/training.md). See [SpecForge PR #1038](https://github.com/sgl-project/SpecForge/pull/1038) for the DSpine training corrections and an online training example.
+See the [SpecForge training guide](https://github.com/sgl-project/SpecForge/blob/main/docs/sections/basic_usage/training.md)
+and [DSpine online training example](https://github.com/sgl-project/SpecForge/pull/1038).
 
 ## Roadmap
 
-- [ ] Training code for DSpine
-- [ ] DSpine for Qwen3.8-27B
+- [x] Training code for DSpine
+- [x] Qwen3.8-27B inference
+- [x] [Qwen3.8-27B draft weight release](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16)
 
 ## Acknowledgements
 

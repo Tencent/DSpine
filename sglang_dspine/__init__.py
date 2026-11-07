@@ -1,4 +1,3 @@
-"""DSpine speculative decoding plugin for SGLang 0.5.20.
-Registers DSPINE through the ``sglang.srt.plugins`` entry point."""
+"""DSpine serving on SGLang 0.5.22."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

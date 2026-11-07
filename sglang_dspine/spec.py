@@ -1,11 +1,8 @@
-"""SGLang algorithm interface, server-argument validation, and checkpoint mapping.
-
-DSPINE follows the DFlash-family scheduling and verification conventions.
-"""
+"""DSpine serving on SGLang 0.5.22."""
 
 from typing import Type
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 
 ALGORITHM = "DSPINE"
@@ -13,19 +10,15 @@ FP4_KV_CACHE_DTYPES = ("nvfp4", "fp4_mx_block16")
 
 
 class DSpineSpecAlgo(CustomSpecAlgo):
-    """DFlash-family behavior for SGLang's custom speculative algorithm interface.
+    def supports_ragged_verify(self) -> bool:
+        from sglang_dspine.verification.ragged import ragged_active
 
-    SGLang 0.5.20's scheduler also calls ``create_future_map``, ``need_topk``, and
-    ``carries_draft_hidden_states``, which ``CustomSpecAlgo`` does not define.
-    """
+        return ragged_active()
 
     def is_dflash_family(self) -> bool:
         return True
 
     def supports_target_verify_for_draft(self) -> bool:
-        return True
-
-    def supports_mixed_chunk(self) -> bool:
         return True
 
     def supports_grammar_overlap(self) -> bool:
@@ -52,7 +45,7 @@ class DSpineSpecAlgo(CustomSpecAlgo):
 
 
 def worker_factory(server_args) -> Type:
-    from sglang_dspine.worker import DSpineWorkerV2
+    from sglang_dspine.runtime.worker import DSpineWorkerV2
 
     return DSpineWorkerV2
 
@@ -65,16 +58,9 @@ def is_dspine(algorithm) -> bool:
 
 
 def handle_dspine_server_args(server_args) -> None:
-    """Validate DSPINE options, then apply DFlash argument resolution.
-
-    SGLang gives registered algorithms a recording stand-in in ``handle_server_args``;
-    ``_handle_dflash`` needs the real record to place its declarations correctly.
-    The plugin calls this function after ``handle_speculative_decoding`` returns,
-    while ``DSpineSpecAlgo`` keeps the inherited no-op ``handle_server_args``.
-    """
     from sglang.srt.arg_groups.speculative_hook import _handle_dflash
 
-    cfg = resolving_view(server_args)
+    cfg = resolved_view(server_args)
     if not str(cfg.device).startswith("cuda"):
         raise ValueError(
             f"DSPINE speculative decoding requires CUDA, got device={cfg.device!r}."
@@ -87,20 +73,42 @@ def handle_dspine_server_args(server_args) -> None:
         raise ValueError("DSPINE does not support prefill/decode disaggregation.")
     if cfg.kv_cache_dtype in FP4_KV_CACHE_DTYPES:
         raise ValueError(
-            f"DSPINE does not support the {cfg.kv_cache_dtype} KV cache: its verify commits a "
-            "prefix of a dense draft block, which is validated with the default KV cache only."
+            f"DSPINE does not support the {cfg.kv_cache_dtype} KV cache: its verify commits a prefix of a dense draft block, which is validated with the default KV cache only."
         )
     if cfg.enable_linear_replayssm_spec:
-        raise ValueError("DSPINE does not support --enable-linear-replayssm-spec.")
+        if int(cfg.pp_size) != 1:
+            raise ValueError("DSPine ReplaySSM port requires pp_size == 1.")
+        if cfg.enable_unified_memory or cfg.enable_page_major_kv_layout:
+            raise ValueError(
+                "DSPINE ReplaySSM requires the standard non-unified Mamba pool."
+            )
+        if cfg.disable_radix_cache:
+            raise ValueError("DSPINE prefix cache requires radix caching enabled.")
+        if cfg.mamba_radix_cache_strategy != "extra_buffer":
+            raise ValueError(
+                "DSPINE ReplaySSM prefix caching requires extra_buffer checkpoints."
+            )
+        if cfg.mamba_ssm_dtype not in (None, "float32"):
+            raise ValueError("DSPINE ReplaySSM requires --mamba-ssm-dtype float32.")
+        if cfg.enable_linear_replayssm:
+            raise ValueError(
+                "DSPINE spec ReplaySSM cannot also enable decode ReplaySSM."
+            )
+        if cfg.linear_attn_backend != "triton":
+            raise ValueError("DSPINE ReplaySSM requires --linear-attn-backend triton.")
+        for name in (
+            "linear_attn_prefill_backend",
+            "linear_attn_decode_backend",
+            "linear_attn_verify_backend",
+        ):
+            if getattr(cfg, name) not in (None, "triton"):
+                raise ValueError(
+                    "DSPINE ReplaySSM requires Triton linear-attention backends."
+                )
     _handle_dflash(server_args)
 
 
 def map_dspine_draft_architecture(model_config) -> None:
-    """Map bridge-bearing DFlash/DSpine drafts to DSpineDraftModel under DSPINE.
-
-    Called before SGLang's draft-config handling. Other algorithms reject these
-    checkpoints because they would omit the code bridge.
-    """
     hf_config = model_config.hf_config
     architectures = getattr(hf_config, "architectures", None)
     if not model_config.is_draft_model or not architectures:
@@ -112,12 +120,18 @@ def map_dspine_draft_architecture(model_config) -> None:
     if is_dspine(model_config.speculative_algorithm or ""):
         if not carries_bridge:
             raise ValueError(
-                "--speculative-algorithm DSPINE needs a DSpine draft "
-                "(dflash_config.selected_prefix_code_bridge is missing)."
+                "--speculative-algorithm DSPINE needs a DSpine draft (dflash_config.selected_prefix_code_bridge is missing)."
             )
         architectures[0] = "DSpineDraftModel"
+        is_causal = getattr(hf_config, "is_causal", None)
+        if dict(dflash_config).get("draft_block_causal"):
+            if is_causal is False:
+                raise ValueError(
+                    "DSpine draft config contradicts itself: dflash_config.draft_block_causal is true but is_causal is false."
+                )
+            if is_causal is None:
+                hf_config.is_causal = True
     elif carries_bridge:
         raise ValueError(
-            "This draft checkpoint carries a DSpine code bridge; serve it with "
-            "--speculative-algorithm DSPINE."
+            "This draft checkpoint carries a DSpine code bridge; serve it with --speculative-algorithm DSPINE."
         )

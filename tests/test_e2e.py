@@ -7,7 +7,16 @@ Skipped when either model environment variable is unset.
 import os
 import unittest
 
+import pytest
 import requests
+
+TARGET_MODEL = os.environ.get("DSPINE_TARGET_MODEL")
+DRAFT_MODEL = os.environ.get("DSPINE_DRAFT_MODEL")
+if not (TARGET_MODEL and DRAFT_MODEL):
+    pytest.skip(
+        "set DSPINE_TARGET_MODEL and DSPINE_DRAFT_MODEL", allow_module_level=True
+    )
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -15,9 +24,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
-TARGET_MODEL = os.environ.get("DSPINE_TARGET_MODEL")
-DRAFT_MODEL = os.environ.get("DSPINE_DRAFT_MODEL")
 
 PROMPTS = [
     "Write a Python function that returns the n-th Fibonacci number.",

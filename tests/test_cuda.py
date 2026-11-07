@@ -3,32 +3,31 @@ Compare independent references and bf16 bridge rounding; test Monte Carlo sample
 verification and CUDA graph replay with re-staged sampling parameters."""
 
 import math
-import os
 import types
 from unittest import mock
 
 import pytest
 import torch
-from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-    DecodeCudaGraphRunner,
-)
-
-from sglang_dspine import kernels as K
-from sglang_dspine.graph_runner import DSpineDraftCudaGraphRunner
-from sglang_dspine.models.dspine import DSpineCodeBridge
-from sglang_dspine.worker import (
-    DSpineDraftSampler,
-    build_dspine_target_probs,
-    dspine_accept_sampling,
-)
-
 from ref_utils import (
     assert_follows,
     draft_candidates_overlapping,
+    ref_bridge_forward,
     ref_refine_table,
     ref_sample_chain,
     ref_target_row,
     sampling_info,
+)
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
+
+from sglang_dspine.kernels import dspine as K
+from sglang_dspine.models.dspine import DSpineCodeBridge
+from sglang_dspine.runtime.graph_runner import DSpineDraftCudaGraphRunner
+from sglang_dspine.runtime.worker import (
+    DSpineDraftSampler,
+    build_dspine_target_probs,
+    dspine_accept_sampling,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -59,11 +58,10 @@ def _bridge(implementation, seed=0, H=512, C=64, R=64, T=4, L=2, V=300):
         },
     )
     with (
-        mock.patch.dict(os.environ, {"SGLANG_DSPINE_BRIDGE_IMPL": implementation}),
         torch.device(DEV),
     ):
         bridge = DSpineCodeBridge(cfg).to(torch.bfloat16)
-    assert bridge.implementation == implementation
+    assert bridge.implementation == "fused"
     g = torch.Generator().manual_seed(seed)
     for name, t in list(bridge.named_parameters()) + list(bridge.named_buffers()):
         if name == "packed_weight":
@@ -94,7 +92,7 @@ def test_bridge_fused_matches_eager():
     for layer in (0, 1):
         sf, se = {}, {}
         nf, of = fused(hidden, residual, input_ids, layer, norm, sf)
-        ne, oe = eager(hidden, residual, input_ids, layer, norm, se)
+        ne, oe = ref_bridge_forward(eager, hidden, residual, input_ids, layer, norm, se)
         assert torch.equal(
             sf["raw"], se["raw"]
         )  # both round (hidden + residual) once, RNE

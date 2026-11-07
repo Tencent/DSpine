@@ -6,11 +6,12 @@ import math
 import types
 
 import torch
+import torch.nn.functional as F
 
 
 def ref_sample_chain(table, inv_t, top_k, top_p, min_p, greedy, u, cand, greedy_tok, T):
     """(out_tok [n], out_q [n, K]) of the sampled serial chain, per the contract of
-    sglang_dspine.kernels.serial_sample_chain."""
+    sglang_dspine.kernels.dspine.serial_sample_chain."""
     n, k, _ = table.shape
     tm1 = T - 1
     out_tok = torch.empty(n, dtype=torch.int64)
@@ -53,7 +54,7 @@ def ref_refine_table(
     raw, rms, query, anchors, cand, codebook, pg, pv, gb, w_last, norm_w, lm, eps, T
 ):
     """float64 Table[n, j, c] of the redone last write, per the contract of
-    sglang_dspine.kernels.serial_rs_table."""
+    sglang_dspine.kernels.dspine.serial_rs_table."""
     m, h = raw.shape
     n, k = cand.shape
     c_size = codebook.shape[1]
@@ -159,3 +160,46 @@ def sampling_info(bs, *, temperature, top_k=None, top_p=None, min_p=None, device
         need_min_p_sampling=min_p is not None,
         is_all_greedy=False,
     )
+
+
+def ref_bridge_forward(self, hidden, residual, input_ids, layer, next_norm, stash):
+    """Plain-torch version of the fused path with the same rounding points (the eager A/B
+    path, and the reference the fused kernels are tested against)."""
+    (t, r) = (self.block_size, self.rank)
+    raw = hidden if residual is None else hidden + residual
+    f = raw.float()
+    rms = f.square().mean(-1).clamp_min(torch.finfo(torch.float32).tiny).sqrt()
+    normalized = (f / (rms[:, None] + self.eps)).to(raw.dtype)
+    projected = F.linear(normalized, self.layer_read_weight(layer)).float()
+    codes = (
+        math.sqrt(self.code_size)
+        * projected
+        / (projected.norm(dim=-1, keepdim=True) + self.eps)
+    )
+    anchors = input_ids.view(-1, t)[:, 0]
+    anchor_codes = (
+        math.sqrt(self.code_size) * F.embedding(anchors, self.codebook).float()
+    )
+    codes = codes.view(-1, t, self.code_size)
+    codes = torch.cat((anchor_codes[:, None, :], codes[:, 1:]), dim=1).view(
+        -1, self.code_size
+    )
+    packed = F.linear(codes.to(raw.dtype), self.packed_weight)
+    if stash is not None:
+        stash.update(raw=raw, rms=rms, packed=packed)
+    (q, s, v) = packed.float().view(-1, t, 3 * r).split(r, dim=-1)
+    gate = torch.sigmoid(q[:, 1:] + s[:, :-1] + self.gate.bias.float())
+    message = torch.cat((torch.zeros_like(q[:, :1]), gate * v[:, :-1]), dim=1).to(
+        raw.dtype
+    )
+    delta = F.linear(message.view(-1, r), self.feature_write_weights[layer]).float()
+    not_anchor = (torch.arange(raw.shape[0], device=raw.device) % t != 0).float()[
+        :, None
+    ]
+    out = (f + rms[:, None] * delta * not_anchor).to(raw.dtype)
+    x = out.float()
+    y = (
+        x * torch.rsqrt(x.square().mean(-1, keepdim=True) + next_norm.variance_epsilon)
+    ).to(raw.dtype)
+    normed = (y.float() * next_norm.weight.float()).to(raw.dtype)
+    return (normed, out)

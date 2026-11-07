@@ -1,22 +1,20 @@
 """CPU tests for worker and graph-runner integration with DFlashWorkerV2.
 Stand-ins verify proposal routing and sampled execution after graph replay."""
 
-import logging
 import math
 import types
 from unittest import mock
 
 import pytest
 import torch
+from ref_utils import sampling_info
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 
-from sglang_dspine.graph_runner import DSpineDraftCudaGraphRunner
 from sglang_dspine.models.dspine import DSpineCodeBridge
-from sglang_dspine.worker import DSpineDraftSampler, DSpineWorkerV2
-
-from ref_utils import sampling_info
+from sglang_dspine.runtime.graph_runner import DSpineDraftCudaGraphRunner
+from sglang_dspine.runtime.worker import DSpineDraftSampler, DSpineWorkerV2
 
 
 def _graph_runner(sampler):
@@ -155,6 +153,9 @@ def _worker(sampler, block_size):
     worker._dspine_sampler = sampler
     worker.block_size = block_size
     worker._selector_sample = None
+    worker.target_distribution = None
+    worker._target_tp_rank = 0
+    worker.dspine_round_counts = {"staged": 0, "sampled": 0, "eager": 0}
     return worker
 
 
@@ -195,20 +196,29 @@ def test_eager_path_stages_runs_the_tail_and_samples_only_a_sampled_round():
     assert torch.equal(proposal, sampler.out.view(bs, T - 1))
 
 
-def test_seed_warning_reads_the_rank_from_parallel_state(caplog):
-    # SGLang 0.5.20: ModelRunner has no tp_rank; the worker reads its rank from ps.
-    worker = _worker(None, 4)
-    worker.ps = types.SimpleNamespace(tp_rank=0)
-    worker.model_runner = types.SimpleNamespace()
-    worker._warned_sampling_seed = False
-    info = types.SimpleNamespace(is_all_greedy=False, sampling_seed=torch.tensor([7]))
-    batch = types.SimpleNamespace(sampling_info=info)
-    with caplog.at_level(logging.WARNING, logger="sglang_dspine.worker"):
-        worker._validate_phase1_sampling_support(batch)
-        worker._validate_phase1_sampling_support(batch)
-    assert worker._warned_sampling_seed
-    warned = [r for r in caplog.records if "sampling_seed is not" in r.getMessage()]
-    assert len(warned) == 1
+def test_request_seeds_and_positions_are_staged_before_the_draft():
+    from sglang_dspine.sampling.random import RequestRNG
+
+    sampler = _RecordingSampler(2, 3, 8)
+    sampler.random = RequestRNG()
+    worker = _worker(sampler, 4)
+    info = types.SimpleNamespace(
+        is_all_greedy=False, sampling_seed=torch.tensor([7, 19])
+    )
+    positions = torch.tensor([31, 211], dtype=torch.int32)
+    batch = types.SimpleNamespace(
+        sampling_info=info,
+        seq_lens=positions,
+        forward_mode=types.SimpleNamespace(
+            is_extend=lambda: False, is_idle=lambda: False
+        ),
+        is_extend_in_batch=False,
+    )
+    worker._validate_phase1_sampling_support(batch)
+    assert sampler.random.seeds is info.sampling_seed
+    positions.add_(1)
+    assert sampler.random.positions.tolist() == [31, 211]
+    assert sampler.calls == [("stage", 2, info)]
 
 
 def test_sampled_verify_refuses_a_round_whose_sampled_chain_did_not_run():

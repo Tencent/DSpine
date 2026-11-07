@@ -1,4 +1,4 @@
-"""CPU tests for DSPINE registration and hooks against SGLang 0.5.20.
+"""CPU tests for DSPINE registration and hooks against SGLang 0.5.22.
 Verify algorithm behavior, draft architecture registration, and applied hooks."""
 
 import types
@@ -15,14 +15,14 @@ from sglang.srt.speculative import spec_utils
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from sglang_dspine import plugin
-from sglang_dspine.graph_runner import DSpineDraftCudaGraphRunner
 from sglang_dspine.models.dspine import DSpineDraftModel
+from sglang_dspine.runtime.graph_runner import DSpineDraftCudaGraphRunner
+from sglang_dspine.runtime.worker import DSpineWorkerV2
 from sglang_dspine.spec import (
     DSpineSpecAlgo,
     handle_dspine_server_args,
     map_dspine_draft_architecture,
 )
-from sglang_dspine.worker import DSpineWorkerV2
 
 
 @pytest.fixture(scope="module")
@@ -53,7 +53,7 @@ def test_algorithm_answers_like_a_dflash_family_member(dspine):
         is_standalone=False,
         is_ngram=False,
         supports_target_verify_for_draft=True,
-        supports_mixed_chunk=True,
+        supports_mixed_chunk=False,
         supports_ragged_verify=False,
         supports_grammar_overlap=True,
         has_draft_kv=True,
@@ -149,23 +149,34 @@ def _server_args(**overrides):
         disaggregation_mode="null",
         kv_cache_dtype="auto",
         enable_linear_replayssm_spec=False,
+        pp_size=1,
+        enable_unified_memory=False,
+        enable_page_major_kv_layout=False,
+        disable_radix_cache=False,
+        mamba_radix_cache_strategy="extra_buffer",
+        mamba_ssm_dtype="float32",
+        enable_linear_replayssm=False,
+        linear_attn_backend="triton",
+        linear_attn_prefill_backend=None,
+        linear_attn_decode_backend=None,
+        linear_attn_verify_backend=None,
     )
     fields.update(overrides)
     return types.SimpleNamespace(**fields)
 
 
 def test_worker_constructor_matches_the_installed_base():
-    # SGLang 0.5.20 passes ParallelState (`ps`) when constructing draft workers.
+    # SGLang 0.5.22 resolves parallel state through runtime_context.
     # Keep the constructor signature aligned with DFlashWorkerV2.
     import inspect
 
     from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
-    from sglang_dspine.worker import DSpineWorkerV2
+    from sglang_dspine.runtime.worker import DSpineWorkerV2
 
     base = list(inspect.signature(DFlashWorkerV2.__init__).parameters)
     assert list(inspect.signature(DSpineWorkerV2.__init__).parameters) == base
-    assert "ps" in base
+    assert "ps" not in base
 
 
 def test_server_args_fields_exist_in_this_sglang():
@@ -187,7 +198,7 @@ def test_dspine_envelope_then_dflash_resolution():
             dict(disaggregation_mode="decode"),
             dict(kv_cache_dtype="nvfp4"),
             dict(kv_cache_dtype="fp4_mx_block16"),
-            dict(enable_linear_replayssm_spec=True),
+            dict(enable_linear_replayssm_spec=True, disable_radix_cache=True),
         ):
             with pytest.raises(ValueError):
                 handle_dspine_server_args(_server_args(**bad))
@@ -238,3 +249,25 @@ def test_config_draft_model_hook_maps_before_sglang_runs(dspine):
         lambda c: seen.append(list(c.hf_config.architectures)), config
     )
     assert seen == [["DSpineDraftModel"]]
+
+
+def test_ragged_support_is_scoped_to_the_packed_target_call(dspine):
+    from sglang_dspine.verification.ragged import ragged_scope
+
+    assert dspine.supports_ragged_verify() is False
+    with ragged_scope():
+        assert dspine.supports_ragged_verify() is True
+    assert dspine.supports_ragged_verify() is False
+
+
+def test_replayssm_accepts_prefix_cache_and_rejects_disabled_cache():
+    with mock.patch("sglang.srt.arg_groups.speculative_hook._handle_dflash") as resolve:
+        cfg = _server_args(enable_linear_replayssm_spec=True)
+        handle_dspine_server_args(cfg)
+        resolve.assert_called_once_with(cfg)
+        with pytest.raises(ValueError):
+            handle_dspine_server_args(
+                _server_args(
+                    enable_linear_replayssm_spec=True, disable_radix_cache=True
+                )
+            )

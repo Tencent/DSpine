@@ -1,19 +1,23 @@
-"""CPU tests for sampled-verify target distributions and config parsing.
-Check both sampling backends against hand-computed cases and independent float64
-references; CUDA-free renormalization uses the PyTorch fallbacks."""
+"""Target-distribution checks against independent float64 references."""
 
+import copy
 import types
 
 import pytest
 import torch
+from ref_utils import ref_target_row, sampling_info
 
 from sglang_dspine.models.dspine import resolve_dspine_head_topk
-from sglang_dspine.worker import build_dspine_target_probs
-
-from ref_utils import ref_target_row, sampling_info
+from sglang_dspine.runtime.worker import build_dspine_target_probs
 
 
 def _build(logits, T, info, backend):
+    if backend == "flashinfer" and torch.cuda.is_available():
+        logits = logits.cuda()
+        info = copy.copy(info)
+        for name, value in vars(info).items():
+            if isinstance(value, torch.Tensor):
+                setattr(info, name, value.cuda())
     bs = logits.shape[0] // T
     return build_dspine_target_probs(
         next_token_logits=logits,
@@ -21,7 +25,14 @@ def _build(logits, T, info, backend):
         block_size=T,
         bs=bs,
         sampling_backend=backend,
-    )
+    ).cpu()
+
+
+def test_constructing_target_probabilities_preserves_rng_state():
+    logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+    before = torch.get_rng_state().clone()
+    _build(logits, 1, sampling_info(1, temperature=1.0, top_k=2, top_p=0.9), "pytorch")
+    assert torch.equal(before, torch.get_rng_state())
 
 
 def test_target_probs_hand_computed():

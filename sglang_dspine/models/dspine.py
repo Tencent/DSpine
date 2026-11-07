@@ -1,15 +1,8 @@
-"""DSpine draft model with per-layer code bridges and serial last-write refinement.
-
-The block's first row is the last committed token (the anchor). Bridge writes
-condition each subsequent row on its predecessor; the refinement tail runs in
-``DSpineDraftSampler``.
-"""
+"""DSpine serving on SGLang 0.5.22."""
 
 from __future__ import annotations
 
 import logging
-import math
-import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -22,20 +15,18 @@ from sglang.srt.speculative.dflash_utils import _get_dflash_config
 from torch import nn
 from torch.nn import functional as F
 
-from sglang_dspine import kernels
+from sglang_dspine.kernels import dspine as kernels
+from sglang_dspine.layers.attention import (
+    validate_native_attention_config,
+    validate_native_layer_windows,
+)
 
 logger = logging.getLogger(__name__)
-
 BRIDGE_PREFIX = "selected_prefix_bridge."
 
 
 def resolve_dspine_head_topk(config, num_layers: int) -> int:
-    """Resolve the width K for serial last-write refinement.
-
-    Read ``code_bridge_second_pass`` (mode ``serial_table``, ``first_exact`` is the
-    last layer) and/or ``dflash_config.selected_prefix_last_write_refine`` (kind
-    ``exact_sender``). Both sources must agree when present.
-    """
+    """The refinement width K; fail loud unless the checkpoint states it unambiguously."""
     dflash_cfg = _get_dflash_config(config)
     found = {}
     second = getattr(config, "code_bridge_second_pass", None)
@@ -46,52 +37,46 @@ def resolve_dspine_head_topk(config, num_layers: int) -> int:
             raise ValueError(f"Unknown code_bridge_second_pass keys: {sorted(unknown)}")
         if second.get("mode") != "serial_table":
             raise ValueError(
-                "DSPINE serves the serial last-write refinement only; the checkpoint config says "
-                f"code_bridge_second_pass.mode={second.get('mode')!r}"
+                f"DSPINE serves the serial last-write refinement only; the checkpoint config says code_bridge_second_pass.mode={second.get('mode')!r}"
             )
         if int(second.get("first_exact", -1)) != num_layers - 1:
             raise ValueError(
-                "serial_table redoes the LAST write only: code_bridge_second_pass.first_exact "
-                f"must be {num_layers - 1}, got {second.get('first_exact')!r}"
+                f"serial_table redoes the LAST write only: code_bridge_second_pass.first_exact must be {num_layers - 1}, got {second.get('first_exact')!r}"
             )
         found["code_bridge_second_pass.head_topk"] = int(second["head_topk"])
     refine = dflash_cfg.get("selected_prefix_last_write_refine")
     if refine is not None:
-        if refine.get("kind") != "exact_sender":
+        refine = dict(refine)
+        if (
+            set(refine) - {"kind", "version", "head_topk", "weight"}
+            or not {"kind", "head_topk"} <= set(refine)
+            or refine["kind"] != "exact_sender"
+            or refine.get("version", 1) != 1
+            or (not refine.get("weight", 1.0) >= 0)
+        ):
             raise ValueError(
-                "DSPINE expects selected_prefix_last_write_refine.kind == 'exact_sender', "
-                f"got {refine.get('kind')!r}"
+                f"DSPINE expects selected_prefix_last_write_refine = {{kind: 'exact_sender', version: 1, head_topk, weight >= 0}}, got {refine!r}"
             )
         found["dflash_config.selected_prefix_last_write_refine.head_topk"] = int(
             refine["head_topk"]
         )
     if not found:
         raise ValueError(
-            "DSPINE checkpoint config names no refinement width: add "
-            "code_bridge_second_pass {mode: serial_table, first_exact, head_topk} or "
-            "dflash_config.selected_prefix_last_write_refine.head_topk"
+            "DSPINE checkpoint config names no refinement width: add code_bridge_second_pass {mode: serial_table, first_exact, head_topk} or dflash_config.selected_prefix_last_write_refine.head_topk"
         )
     values = set(found.values())
     if len(values) != 1:
         raise ValueError(f"DSPINE refinement widths disagree: {found}")
     k = values.pop()
-    if k & (k - 1) or not 2 <= k <= 64:
+    if k & k - 1 or not 2 <= k <= 64:
         raise ValueError(f"DSPINE head_topk must be a power of two in [2, 64], got {k}")
     return k
 
 
 class DSpineCodeBridge(nn.Module):
-    """Graph-capturable post-layer writes with DFlash anchor-row semantics.
-
-    ``dflash_config.selected_prefix_code_bridge`` specifies ``code_size``, ``rank``,
-    and ``eps``. ``selected_prefix_feature_layers`` is 1-based and includes the last
-    layer; ``selected_prefix_feature_writes`` and ``draft_block_causal`` are true,
-    ``selected_prefix_feature_write_mode`` is ``independent``, and
-    ``selected_prefix_terminal`` is false.
-
-    Each write fuses the next layer's input RMSNorm (or final norm).
-    ``SGLANG_DSPINE_BRIDGE_IMPL=eager`` uses plain torch operations.
-    """
+    """Graph-capturable post-layer code writes with anchor-row (DFlash) semantics.  Weights load
+    by their checkpoint names under ``selected_prefix_bridge.``; terminal-corrected bridges are
+    refused. The bridge always uses its fused kernels."""
 
     def __init__(self, config):
         super().__init__()
@@ -110,8 +95,7 @@ class DSpineCodeBridge(nn.Module):
             raise ValueError("Reliability probes are not part of the DSPINE path")
         if cfg.get("selected_prefix_feature_next_token_rows", False):
             raise ValueError(
-                "DSPINE's serial refinement is defined for anchor-row (DFlash) semantics; "
-                "next-token rows are a DSpark layout"
+                "DSPINE's serial refinement is defined for anchor-row (DFlash) semantics; next-token rows are a DSpark layout"
             )
         bridge = cfg.get("selected_prefix_code_bridge")
         if not bridge:
@@ -125,7 +109,7 @@ class DSpineCodeBridge(nn.Module):
         self.block_size = int(config.block_size)
         self.eps = float(bridge["eps"])
         self.active_layers = frozenset(
-            int(i) - 1 for i in cfg["selected_prefix_feature_layers"]
+            (int(i) - 1 for i in cfg["selected_prefix_feature_layers"])
         )
         if not self.active_layers <= set(range(self.num_layers)):
             raise ValueError(
@@ -135,10 +119,24 @@ class DSpineCodeBridge(nn.Module):
             raise ValueError(
                 "DSPINE refines the last layer's write, so the last layer must be active"
             )
-        implementation = os.environ.get("SGLANG_DSPINE_BRIDGE_IMPL", "fused")
-        if implementation not in ("fused", "eager"):
-            raise ValueError(f"Unknown DSPINE bridge implementation {implementation!r}")
-        self.implementation = implementation
+        self.terminal_residual_rank = cfg.get(
+            "selected_prefix_terminal_residual_rank", 0
+        )
+        if (
+            type(self.terminal_residual_rank) is not int
+            or not 0 <= self.terminal_residual_rank <= self.rank
+        ):
+            raise ValueError(
+                f"selected_prefix_terminal_residual_rank must be an int in [0, rank], got {self.terminal_residual_rank!r}"
+            )
+        if self.terminal_residual_rank and (
+            cfg.get("selected_prefix_last_write_refine") is None
+            or cfg.get("selected_prefix_feature_gt_training") is not True
+        ):
+            raise ValueError(
+                "The terminal token residual needs the exact-code last-write refinement (selected_prefix_last_write_refine, selected_prefix_feature_gt_training = true)"
+            )
+        self.implementation = "fused"
         self.prev = nn.Linear(self.code_size, self.rank, bias=False)
         self.gate = nn.Linear(self.code_size, self.rank, bias=True)
         self.predecessor_gate = nn.Linear(self.code_size, self.rank, bias=False)
@@ -166,6 +164,15 @@ class DSpineCodeBridge(nn.Module):
             ),
             requires_grad=False,
         )
+        rt = self.terminal_residual_rank
+        self.register_buffer(
+            "terminal_residual_embedding",
+            torch.empty(config.vocab_size, rt, dtype=torch.bfloat16) if rt else None,
+        )
+        self.register_buffer(
+            "terminal_residual_projection",
+            torch.empty(self.rank, rt, dtype=torch.bfloat16) if rt else None,
+        )
         for name in ("independent_write_version", "terminal_disabled_version"):
             self.register_buffer(name, torch.zeros((), dtype=torch.int64))
         self.register_buffer("packed_weight", None, persistent=False)
@@ -179,8 +186,7 @@ class DSpineCodeBridge(nn.Module):
         dest = destinations[name]
         if tuple(dest.shape) != tuple(tensor.shape):
             raise ValueError(
-                f"DSPINE code-bridge shape mismatch: {name}: {tuple(tensor.shape)} vs "
-                f"{tuple(dest.shape)}"
+                f"DSPINE code-bridge shape mismatch: {name}: {tuple(tensor.shape)} vs {tuple(dest.shape)}"
             )
         dest.data.copy_(tensor)
         self._loaded.add(name)
@@ -206,7 +212,6 @@ class DSpineCodeBridge(nn.Module):
         packed = torch.cat(
             (self.gate.weight, self.predecessor_gate.weight, self.prev.weight), dim=0
         ).contiguous()
-        # Preserve graph-captured storage during same-shape weight reloads.
         if self.packed_weight is None:
             self.packed_weight = packed
         else:
@@ -219,6 +224,35 @@ class DSpineCodeBridge(nn.Module):
             if layer == self.num_layers - 1
             else self.early_read_weights[layer]
         )
+
+    @torch.no_grad()
+    def fold_terminal_sender_table(
+        self, table: torch.Tensor, chunk: int = 4096
+    ) -> torch.Tensor:
+        """Add the terminal token residual to the value half of a sender table in place:
+        table[v, R:] = dtype(float(table[v, R:]) + float(dtype(E[v]) @ dtype(B)^T)), dtype = the
+        table's (BF16 for the greedy TSV table).  The engine's fold_terminal_sender_table, same
+        rounding points.  table [V, 2R] = [G_p e_v; A e_v]; a no-op without the residual."""
+        if not self.terminal_residual_rank:
+            return table
+        (v, r) = (int(self.codebook.shape[0]), self.rank)
+        if tuple(table.shape) != (v, 2 * r) or table.dtype not in (
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError(
+                f"DSPINE terminal sender table has an unexpected shape or precision: {tuple(table.shape)} {table.dtype}"
+            )
+        weight = self.terminal_residual_projection.to(table.dtype)
+        for start in range(0, v, chunk):
+            end = min(start + chunk, v)
+            residual = F.linear(
+                self.terminal_residual_embedding[start:end].to(table.dtype), weight
+            )
+            table[start:end, r:] = (table[start:end, r:].float() + residual.float()).to(
+                table.dtype
+            )
+        return table
 
     @torch.no_grad()
     def forward(
@@ -240,20 +274,16 @@ class DSpineCodeBridge(nn.Module):
             )
         if hidden.dtype != torch.bfloat16:
             raise ValueError("The DSPINE code bridge requires BF16 activations")
-        if self.implementation == "fused":
-            return self._forward_fused(
-                hidden, residual, input_ids, layer, next_norm, stash
-            )
-        return self._forward_eager(hidden, residual, input_ids, layer, next_norm, stash)
+        return self._forward_fused(hidden, residual, input_ids, layer, next_norm, stash)
 
     def _read_codes(self, hidden, residual, input_ids, layer):
         """Fused read: (raw [m,H] bf16, rms [m] fp32, codes [m,C] bf16)."""
-        m, h = hidden.shape
-        c, t = self.code_size, self.block_size
+        (m, h) = hidden.shape
+        (c, t) = (self.code_size, self.block_size)
         raw = torch.empty_like(hidden)
         normalized = torch.empty_like(hidden)
         rms = torch.empty(m, device=hidden.device, dtype=torch.float32)
-        kernels.prepare_read[(m,)](
+        kernels.prepare_read[m,](
             hidden,
             hidden if residual is None else residual,
             raw,
@@ -268,7 +298,7 @@ class DSpineCodeBridge(nn.Module):
         projected = F.linear(normalized, self.layer_read_weight(layer))
         codes = torch.empty_like(projected)
         anchors = input_ids.view(-1, t)[:, 0].contiguous()
-        kernels.normalize_codes[(m,)](
+        kernels.normalize_codes[m,](
             projected,
             self.codebook,
             anchors,
@@ -280,17 +310,17 @@ class DSpineCodeBridge(nn.Module):
             triton.next_power_of_2(c),
             enable_fp_fusion=False,
         )
-        return raw, rms, codes
+        return (raw, rms, codes)
 
     def _forward_fused(self, hidden, residual, input_ids, layer, next_norm, stash):
         m = hidden.shape[0]
-        r, t, h = self.rank, self.block_size, self.hidden_size
-        raw, rms, codes = self._read_codes(hidden, residual, input_ids, layer)
+        (r, t, h) = (self.rank, self.block_size, self.hidden_size)
+        (raw, rms, codes) = self._read_codes(hidden, residual, input_ids, layer)
         packed = F.linear(codes, self.packed_weight)
         if stash is not None:
             stash.update(raw=raw, rms=rms, packed=packed)
         message = torch.empty((m, r), device=hidden.device, dtype=hidden.dtype)
-        kernels.feature_message[(m,)](
+        kernels.feature_message[m,](
             packed,
             self.gate.bias,
             message,
@@ -303,7 +333,7 @@ class DSpineCodeBridge(nn.Module):
         valid = torch.ones(m, device=raw.device, dtype=torch.bool)
         output = torch.empty_like(raw)
         normed = torch.empty_like(raw)
-        kernels.feature_finish[(m,)](
+        kernels.feature_finish[m,](
             raw,
             delta,
             rms,
@@ -319,52 +349,7 @@ class DSpineCodeBridge(nn.Module):
             triton.next_power_of_2(h),
             enable_fp_fusion=False,
         )
-        return normed, output
-
-    def _forward_eager(self, hidden, residual, input_ids, layer, next_norm, stash):
-        """Plain-torch version of the fused path with the same rounding points (the eager A/B
-        path, and the reference the fused kernels are tested against)."""
-        t, r = self.block_size, self.rank
-        raw = hidden if residual is None else hidden + residual
-        f = raw.float()
-        rms = f.square().mean(-1).clamp_min(torch.finfo(torch.float32).tiny).sqrt()
-        normalized = (f / (rms[:, None] + self.eps)).to(raw.dtype)
-        projected = F.linear(normalized, self.layer_read_weight(layer)).float()
-        codes = (
-            math.sqrt(self.code_size)
-            * projected
-            / (projected.norm(dim=-1, keepdim=True) + self.eps)
-        )
-        anchors = input_ids.view(-1, t)[:, 0]
-        anchor_codes = (
-            math.sqrt(self.code_size) * F.embedding(anchors, self.codebook).float()
-        )
-        codes = codes.view(-1, t, self.code_size)
-        codes = torch.cat((anchor_codes[:, None, :], codes[:, 1:]), dim=1).view(
-            -1, self.code_size
-        )
-        packed = F.linear(codes.to(raw.dtype), self.packed_weight)
-        if stash is not None:
-            stash.update(raw=raw, rms=rms, packed=packed)
-        q, s, v = packed.float().view(-1, t, 3 * r).split(r, dim=-1)
-        gate = torch.sigmoid(q[:, 1:] + s[:, :-1] + self.gate.bias.float())
-        message = torch.cat((torch.zeros_like(q[:, :1]), gate * v[:, :-1]), dim=1).to(
-            raw.dtype
-        )
-        delta = F.linear(message.view(-1, r), self.feature_write_weights[layer]).float()
-        not_anchor = (torch.arange(raw.shape[0], device=raw.device) % t != 0).float()[
-            :, None
-        ]
-        out = (f + (rms[:, None] * delta) * not_anchor).to(raw.dtype)
-        x = out.float()
-        y = (
-            x
-            * torch.rsqrt(
-                x.square().mean(-1, keepdim=True) + next_norm.variance_epsilon
-            )
-        ).to(raw.dtype)
-        normed = (y.float() * next_norm.weight.float()).to(raw.dtype)
-        return normed, out
+        return (normed, output)
 
 
 class DSpineDecoderLayer(DFlashDecoderLayer):
@@ -381,7 +366,7 @@ class DSpineDecoderLayer(DFlashDecoderLayer):
         if hidden_states.numel() == 0:
             if residual is None:
                 residual = hidden_states
-            return hidden_states, residual
+            return (hidden_states, residual)
         if input_normed:
             if residual is None:
                 raise RuntimeError("A pre-normed DSPINE layer input needs its residual")
@@ -389,69 +374,91 @@ class DSpineDecoderLayer(DFlashDecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            (hidden_states, residual) = self.input_layernorm(hidden_states, residual)
         attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+        (hidden_states, residual) = self.post_attention_layernorm(attn_out, residual)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return (hidden_states, residual)
 
 
 class DSpineDraftModel(DFlashDraftModel):
-    """DFlash draft with a code bridge.
-
-    Accepts ``DSpineDraftModel`` and bridge-bearing ``DFlashDraftModel`` checkpoint
-    architectures, mapped by the plugin under DSPINE.
-    """
+    """DFlash draft + code bridge; the refinement tail runs in DSpineDraftSampler."""
 
     decoder_layer_cls = DSpineDecoderLayer
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         if quant_config is not None:
             raise ValueError("The DSPINE draft does not support quantized weights")
-        # SGLang reads is_causal while constructing attention layers. Infer it from
-        # draft_block_causal when missing or None. Preserve explicit False so the
-        # causal-attention check below rejects it.
+        if _get_dflash_config(config).get("conv_kernel_size"):
+            raise ValueError("DSpine checkpoints do not use grouped draft convolutions")
         if _get_dflash_config(config).get("draft_block_causal"):
             text_config = config.get_text_config()
             if getattr(text_config, "is_causal", None) is None:
                 text_config.is_causal = True
+        self.native_swa_window = validate_native_attention_config(config)
         super().__init__(config, quant_config=quant_config, prefix=prefix)
-        dc = self.draft_config
-        if dc.conv_kernel_size or dc.is_domino or dc.selector_top_k:
-            raise ValueError(
-                "DSPINE drafts carry neither DFlash2 convolutions/selector nor a Domino projector"
+        cfg = _get_dflash_config(config)
+        unsupported = [
+            key
+            for key in (
+                "selector_rank",
+                "selector_top_k",
+                "projector_type",
+                "attention_sink_bias",
             )
-        if self.is_nemotron_35_draft:
+            if cfg.get(key)
+        ]
+        if cfg.get("attention_value_scale") is not None:
+            unsupported.append("attention_value_scale")
+        if getattr(config, "has_embed_tokens", False):
+            unsupported.append("has_embed_tokens")
+        if float(getattr(config, "partial_rotary_factor", None) or 1.0) != 1.0:
+            unsupported.append("partial_rotary_factor")
+        if unsupported:
+            raise ValueError(
+                f"DSPINE drafts are plain DFlash layers with a code bridge; unsupported draft config keys: {unsupported}"
+            )
+        if getattr(self, "is_nemotron_35_draft", False):
             raise ValueError("Nemotron 3.5 draft layouts are not DSPINE drafts")
-        for layer in self.layers:
-            if layer.self_attn.attn.attn_type != AttentionType.DECODER:
-                raise ValueError(
-                    "DSPINE requires causal draft attention in every layer (config is_causal = "
-                    "true with layer_types full_attention)"
-                )
-            if layer.self_attn.sliding_window_size != -1:
-                raise ValueError("DSPINE drafts use full attention layers")
+        validate_native_layer_windows(
+            self.layers, self.native_swa_window, decoder_type=AttentionType.DECODER
+        )
         self.selected_prefix_bridge = DSpineCodeBridge(config)
         if self.selected_prefix_bridge.block_size != int(self.block_size):
             raise ValueError("DSPINE bridge and draft block sizes differ")
+        self.trained_block_size = int(self.block_size)
         self.head_topk = resolve_dspine_head_topk(config, len(self.layers))
+        self.trained_head_topk = self.head_topk
         self.last_write_stash: Optional[dict] = None
-        # The refinement tail (DSpineDraftSampler), registered by DSpineWorkerV2; the draft graph
-        # runner (DSpineDraftCudaGraphRunner) finds it here after each replay.
         self.dspine_sampler = None
 
     def set_block_size(self, block_size: int) -> None:
-        if int(block_size) != self.selected_prefix_bridge.block_size:
+        """Serve with ``block_size`` rows per block (module docstring): 2 <= block_size <= the trained
+        block size.  The block size reaches every part that locates rows inside a block -- the code
+        bridge (anchor rows, predecessor messages) and the convolutions (taps stay inside a block); the
+        DSpine sampler is built with the worker's block size.  Call before any draft forward is
+        captured: the size is read at call time and becomes a constant of a captured graph."""
+        t = int(block_size)
+        if not 2 <= t <= self.trained_block_size:
             raise ValueError(
-                "DSPINE's code bridge is trained for block size "
-                f"{self.selected_prefix_bridge.block_size}; --speculative-num-draft-tokens="
-                f"{block_size} cannot be served"
+                f"DSPINE serves block sizes 2..{self.trained_block_size} (the trained block size) for this draft; got {t}: rows past the trained block were never trained"
             )
-        super().set_block_size(block_size)
+        for layer in self.layers:
+            for conv in (layer.attention_conv, layer.mlp_conv):
+                if conv is not None and conv.taps > t:
+                    raise ValueError(
+                        f"DSPINE conv_kernel_size={conv.taps} exceeds the served block size {t}"
+                    )
+        self.block_size = t
+        self.selected_prefix_bridge.block_size = t
+        for layer in self.layers:
+            for conv in (layer.attention_conv, layer.mlp_conv):
+                if conv is not None:
+                    conv.block_size = t
 
     @torch.no_grad()
     def forward(
@@ -463,12 +470,6 @@ class DSpineDraftModel(DFlashDraftModel):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        """Return final-normed block states [bs*T, H] for the target LM head.
-
-        Row 0 is the anchor; rows 1..T-1 provide pass-1 logits. ``last_write_stash``
-        retains the last write's pre-write raw [bs*T, H] BF16, rms [bs*T] FP32, and
-        packed [bs*T, 3R] BF16 state for ``DSpineDraftSampler``.
-        """
         if input_embeds is None:
             raise ValueError(
                 "DSpineDraftModel requires `input_embeds` (the target embedding)"
@@ -480,7 +481,7 @@ class DSpineDraftModel(DFlashDraftModel):
         input_normed = False
         self.last_write_stash = None
         for index, layer in enumerate(self.layers):
-            hidden_states, residual = layer(
+            (hidden_states, residual) = layer(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -495,13 +496,13 @@ class DSpineDraftModel(DFlashDraftModel):
                     else self.norm
                 )
                 stash = {} if index == last else None
-                hidden_states, residual = bridge(
+                (hidden_states, residual) = bridge(
                     hidden_states, residual, input_ids, index, next_norm, stash
                 )
                 if stash is not None:
                     self.last_write_stash = stash
                 input_normed = True
-        if hidden_states.numel() != 0 and not input_normed:
+        if hidden_states.numel() != 0 and (not input_normed):
             raise RuntimeError(
                 "DSPINE's last layer must end with a (norm-fused) code write"
             )
@@ -510,23 +511,18 @@ class DSpineDraftModel(DFlashDraftModel):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load DFlash parameters and ``selected_prefix_bridge.*`` bridge tensors.
-
-        The optional ``draft_block_causal_version`` tensor must be version 1.
-        """
         bridge = self.selected_prefix_bridge
         bridge.begin_load()
-        # Every non-bridge parameter must come from the checkpoint: poison them first and demand
-        # that loading overwrote every element (the DFlash loader skips unknown names silently).
         dflash_params = [
             (name, p)
-            for name, p in self.named_parameters()
+            for (name, p) in self.named_parameters()
             if not name.startswith(BRIDGE_PREFIX) and p.dtype.is_floating_point
         ]
         with torch.no_grad():
             for _, p in dflash_params:
                 p.fill_(float("nan"))
         causal_seen = []
+        refine_version_seen = []
 
         def dflash_weights():
             for name, tensor in weights:
@@ -539,24 +535,63 @@ class DSpineDraftModel(DFlashDraftModel):
                         raise ValueError("Unsupported causal draft checkpoint version")
                     causal_seen.append(True)
                     continue
-                yield name, tensor
+                if short == "last_write_refine_version":
+                    if int(tensor.item()) != 1:
+                        raise ValueError(
+                            "Unsupported last-write refinement checkpoint version"
+                        )
+                    refine_version_seen.append(True)
+                    continue
+                if short.startswith(
+                    ("prefix_gru.", "embed_proj.", "candidate_selector.")
+                ):
+                    raise ValueError(
+                        f"DSPINE drafts carry no Domino / DFlash2 selector weights ({name})"
+                    )
+                if _loader_param_name(short) not in param_names:
+                    raise ValueError(
+                        f"DSPINE draft checkpoint tensor {name!r} matches no parameter of this draft (check the checkpoint config)"
+                    )
+                yield (name, tensor)
 
+        param_names = set(dict(self.named_parameters()))
         super().load_weights(dflash_weights())
-        unloaded = [name for name, p in dflash_params if torch.isnan(p).any().item()]
+        unloaded = [name for (name, p) in dflash_params if torch.isnan(p).any().item()]
         if unloaded:
             raise ValueError(f"DSPINE checkpoint left parameters unloaded: {unloaded}")
         bridge.prepare()
+        conv = self.layers[0].attention_conv
         logger.info(
-            "Loaded DSPINE draft: layers=%d bridge=%s active_layers=%s code_size=%d rank=%d "
-            "head_topk=%d causal_version_tensor=%s",
+            "Loaded DSPINE draft: layers=%d bridge=%s active_layers=%s code_size=%d rank=%d head_topk=%d terminal_residual_rank=%d conv=%s causal_version_tensor=%s refine_version_tensor=%s",
             len(self.layers),
             bridge.implementation,
-            sorted(i + 1 for i in bridge.active_layers),
+            sorted((i + 1 for i in bridge.active_layers)),
             bridge.code_size,
             bridge.rank,
             self.head_topk,
+            bridge.terminal_residual_rank,
+            f"taps{conv.taps}/group{conv.group_size}" if conv is not None else "none",
             bool(causal_seen),
+            bool(refine_version_seen),
         )
+
+
+_STACKED_NAMES = (
+    ("q_proj", "qkv_proj"),
+    ("k_proj", "qkv_proj"),
+    ("v_proj", "qkv_proj"),
+    ("gate_proj", "gate_up_proj"),
+    ("up_proj", "gate_up_proj"),
+)
+
+
+def _loader_param_name(short: str) -> str:
+    """The parameter a (``model.``-stripped) checkpoint name lands in under SGLang 0.5.22's
+    DFlashDraftModel.load_weights."""
+    for weight_name, param_name in _STACKED_NAMES:
+        if f".{weight_name}." in short:
+            return short.replace(weight_name, param_name)
+    return short
 
 
 EntryClass = [DSpineDraftModel]
