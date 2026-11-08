@@ -11,9 +11,9 @@
   <img src="https://img.shields.io/badge/License-Apache%202.0-green" alt="License: Apache 2.0">
 </p>
 
-DSpine is a parallel drafter for speculative decoding. At every draft layer, each position receives the predicted
-feature of its predecessor, so the causal chain unfolds over network depth while all positions are still drafted in
-parallel.
+DSpine is a parallel drafter for speculative decoding. Each draft layer passes the
+predicted feature of each position to the next, allowing token dependencies to be
+modeled during parallel drafting.
 
 <p align="center">
   <img src="asset/overview.png" alt="DSpine overview" width="90%">
@@ -37,8 +37,8 @@ parallel.
 
 ## Results
 
-Acceptance length on Qwen3-8B. DSpine, DSpark and DFlash2 are all retrained on
-[Open-PerfectBlend](https://huggingface.co/datasets/mlabonne/open-perfectblend) with the same configuration.
+Acceptance length on Qwen3-8B. DSpine, DSpark and DFlash2 are trained on the same
+[Open-PerfectBlend](https://huggingface.co/datasets/mlabonne/open-perfectblend) data with the same training budget.
 
 | Temp. | Method | GSM8K | MATH-500 | HumanEval | MBPP | LCB | MT-Bench | Arena-Hard | Avg. |
 |---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -58,7 +58,7 @@ Acceptance length on Qwen3-8B. DSpine, DSpark and DFlash2 are all retrained on
 
 ## Installation
 
-Requires Python 3.11+ and CUDA. Installation includes SGLang 0.5.22.
+The SGLang plugin uses SGLang 0.5.22 and requires Python 3.11+ and CUDA.
 
 ```bash
 git clone https://github.com/tencent/dspine.git
@@ -68,7 +68,7 @@ python -m pip install -e .
 
 ## Usage
 
-Serve Qwen3-8B:
+### Qwen3-8B
 
 ```bash
 sglang serve \
@@ -89,15 +89,11 @@ sglang serve \
 
 ### Qwen3.8-27B
 
-Single GPU, up to eight concurrent requests. The draft uses block size 16 and an
-8K sliding window.
+The implementation uses [DSpark](https://github.com/deepseek-ai/DeepSpec)-based
+dynamic verification and [ReplaySSM](https://github.com/Johnny-Liou/ReplaySSM).
 
-Uses [DSpark](https://github.com/deepseek-ai/DeepSpec)-based dynamic verification
-and [ReplaySSM](https://github.com/Johnny-Liou/ReplaySSM).
-
-Run [SPS tuning](docs/sps_tuning.md) to choose verification budgets for your GPU
-and workload. Load the result with `--speculative-dspark-sps-table-path sps.json`;
-the default is verify16.
+Run [SPS tuning](docs/sps_tuning.md) to tune dynamic verification for your workload.
+Add `--speculative-dspark-sps-table-path sps.json` to the command below to load the result.
 
 ```bash
 sglang serve \
