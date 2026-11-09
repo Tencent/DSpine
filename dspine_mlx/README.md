@@ -67,8 +67,54 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 ```
 
 `--speculative-num-draft-tokens` is the verify block size (default: the draft's
-trained block size). Only full-attention Qwen3 targets are supported; overlap
+trained block size). The SGLang plugin supports full-attention Qwen3 targets only; overlap
 scheduling, CUDA graphs and the radix cache are disabled.
+
+## Qwen3.8-27B (hybrid target)
+
+[tencent/Qwen3.8-27B-DSpine-b16](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16)
+runs with any MLX build of Qwen3.8-27B (`qwen3_5`: 48 GatedDeltaNet + 16
+full-attention layers). Two pieces make this work:
+
+- **Exact rollback for GatedDeltaNet layers** (`dspine_mlx/hybrid.py`). Their
+  recurrent state lives in an `ArraysCache` that cannot be trimmed. During a
+  verify pass each linear layer records its starting state and recurrence
+  inputs; when only part of the block is accepted, `TargetAdapter.trim`
+  rebuilds the conv state by slicing and replays `gated_delta_update` over the
+  accepted steps. Nothing else is recomputed, and the state equals a plain
+  decode of the accepted prefix.
+- **The draft's 8192-token sliding window.** A fresh draft cache is fed only
+  the last 8192 context rows, which is all the window can see.
+
+Prefill runs in 2048-token chunks and keeps logits for the last position only,
+so long prompts don't hold a full-vocabulary logit tensor in memory.
+
+```bash
+dspine-generate \
+  --target mlx-community/Qwen3.8-27B-4bit \
+  --draft tencent/Qwen3.8-27B-DSpine-b16 \
+  --block-size 5 --quantize-draft --draft-bits 4 \
+  --max-tokens 512 --baseline --prompt "..."
+```
+
+On an Apple GPU a quantized 27B forward costs about the same for 1 to 5 tokens
+and then steps up (4-bit: 34 ms for 1 token, 42 ms for 5, 89 ms for 16), so a
+verify block of 5 is fastest on quantized targets; bf16 keeps 16. A 4-bit
+draft proposes almost the same tokens as bf16 and costs less every round.
+
+MacBook Pro M5 Max (128 GB), greedy, 512 new tokens, 10 prompts (GSM8K,
+MATH-500, HumanEval, MBPP, MT-Bench), thinking on, decode tok/s:
+
+| Target | mlx-lm AR | DSpine | Speedup | Block |
+|---|---:|---:|---:|---:|
+| `mlx-community/Qwen3.8-27B-4bit` | 31.9 | **64.7** | **2.03x** | 5 |
+| `mlx-community/Qwen3.8-27B-8bit` | 17.9 | **52.1** | **2.91x** | 5 |
+| bf16 | 9.1 | **39.1** | **4.31x** | 16 |
+
+With a 33k-token prompt (thinking off, 256 new tokens) the 4-bit target goes
+from 28.3 to 57.3 tok/s (2.02x) and 8-bit from 16.7 to 47.7 tok/s (2.85x).
+`tests/mlx/` checks the rollback against a direct decode and DSpine greedy against
+plain greedy on a tiny random `qwen3_5` model (`pytest tests/mlx`).
 
 ## Results
 
