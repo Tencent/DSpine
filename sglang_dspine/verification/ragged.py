@@ -94,12 +94,12 @@ class RaggedVerifyCaps(VerifyCaps):
                 )
             finally:
                 self.runner.init_new_workspace = old_init
-            if not self.ragged_backend.supports_ragged_verify_graph:
-                raise ValueError(
-                    "The configured attention backend does not support ragged graphs"
-                )
+            # GB10: triton has no ragged verify graph; batches of 8 then verify full blocks
+            self.ragged_supported = self.ragged_backend.supports_ragged_verify_graph
             self.ragged_graph = (
-                DecodeCudaGraphRunner(
+                None
+                if not self.ragged_supported
+                else DecodeCudaGraphRunner(
                     self.runner,
                     attn_backend=self.ragged_backend,
                     speculative_num_steps=1,
@@ -122,7 +122,10 @@ class RaggedVerifyCaps(VerifyCaps):
         super().begin(batch)
         self.executed_tokens = None
         self.ragged_round = (
-            self.in_round and batch.batch_size() == 8 and self.tokens < 128
+            self.ragged_supported
+            and self.in_round
+            and batch.batch_size() == 8
+            and self.tokens < 128
         )
         if self.ragged_round:
             self.active = self.full - 1
