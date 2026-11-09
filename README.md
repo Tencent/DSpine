@@ -37,6 +37,8 @@ modeled during parallel drafting.
 
 ## Results
 
+### Qwen3-8B
+
 Acceptance length on Qwen3-8B. DSpine, DSpark and DFlash2 are trained on the same
 [Open-PerfectBlend](https://huggingface.co/datasets/mlabonne/open-perfectblend) data with the same training budget.
 
@@ -55,6 +57,10 @@ Acceptance length on Qwen3-8B. DSpine, DSpark and DFlash2 are trained on the sam
 
 <sup>†</sup> Official checkpoints: [z-lab/Qwen3-8B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16) and
 [Huang2020/Qwen3-8B-Domino-b16](https://huggingface.co/Huang2020/Qwen3-8B-Domino-b16).
+
+### Qwen3.8-27B
+
+We evaluate Qwen3.8-27B on [WorkBuddy Bench](https://github.com/Tencent/workbuddy-bench) using trajectories collected in the CodeBuddy sandbox. See the [model card](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) for acceptance length and throughput results.
 
 ## Installation
 
