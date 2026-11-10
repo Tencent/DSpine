@@ -17,9 +17,9 @@ from .kernels import dispatch
 
 @dataclass
 class BatchedTailOutput:
-    tokens: mx.array          # [B, T-1] int32
-    candidates: mx.array      # [B, T-1, K] int32
-    q_rows: mx.array | None   # [B, T-1, K] fp32 for sampled requests
+    tokens: mx.array  # [B, T-1] int32
+    candidates: mx.array  # [B, T-1, K] int32
+    q_rows: mx.array | None  # [B, T-1, K] fp32 for sampled requests
 
 
 def _split_stash(tail, stash: dict, batch: int, block: int):
@@ -28,9 +28,7 @@ def _split_stash(tail, stash: dict, batch: int, block: int):
     rms = stash["rms"]
     packed = stash["packed"]
     if raw.shape[0] != batch * T:
-        raise ValueError(
-            f"batched stash has {raw.shape[0]} rows, expected {batch * T}"
-        )
+        raise ValueError(f"batched stash has {raw.shape[0]} rows, expected {batch * T}")
     return (
         raw.reshape(batch, T, -1)[:, 1:].astype(mx.float32),
         rms.reshape(batch, T)[:, 1:].astype(mx.float32),
@@ -41,18 +39,14 @@ def _split_stash(tail, stash: dict, batch: int, block: int):
 def sid_batched(cand: mx.array, anchors: mx.array) -> mx.array:
     """Predecessor ids per request; never crosses a request boundary."""
     batch, _n, k = cand.shape
-    anchor = mx.broadcast_to(
-        anchors.astype(mx.int32)[:, None, None], (batch, 1, k)
-    )
+    anchor = mx.broadcast_to(anchors.astype(mx.int32)[:, None, None], (batch, 1, k))
     return mx.concatenate([anchor, cand[:, :-1]], axis=1)
 
 
 def _prepare(tail, rows, stash, anchors, batch: int, block: int):
     n = int(block) - 1
     if rows.shape[0] != batch * n:
-        raise ValueError(
-            f"batched tail got {rows.shape[0]} rows, expected {batch * n}"
-        )
+        raise ValueError(f"batched tail got {rows.shape[0]} rows, expected {batch * n}")
     raw, rms, q = _split_stash(tail, stash, batch, block)
     cand = tail.candidates(rows).reshape(batch, n, tail.k)
     return cand, raw, rms, q, sid_batched(cand, anchors)
@@ -73,9 +67,7 @@ def _greedy_scores(tail, cand, raw, rms, q, sid):
 
 def _sample_table(tail, cand, raw, rms, q, sid):
     e = tail.sqrt_c * tail.codebook[sid].astype(mx.float32)  # [B,n,K,C]
-    gate = mx.sigmoid(
-        q[:, :, None, :] + mx.matmul(e, tail.pred_gate_w.T) + tail.gate_b
-    )
+    gate = mx.sigmoid(q[:, :, None, :] + mx.matmul(e, tail.pred_gate_w.T) + tail.gate_b)
     value = mx.matmul(e, tail.prev_w.T)
     refined = raw[:, :, None, :] + rms[:, :, None, None] * mx.matmul(
         gate * value, tail.write_w.T

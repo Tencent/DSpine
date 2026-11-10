@@ -46,15 +46,11 @@ def sampled_verify(
     Returns (accept_len, bonus). Committed tokens follow the target's filtered
     distribution for any draft q.
     """
-    probs = mx.softmax(
-        logits.astype(mx.float32) * float(inv_temp), axis=-1
-    )
+    probs = mx.softmax(logits.astype(mx.float32) * float(inv_temp), axis=-1)
     p = filter_target_probs(probs, top_k, top_p, min_p)  # [T, V]
     n = draft_tokens.shape[0]
     p_d = mx.take_along_axis(p[:n], draft_tokens[:, None], axis=-1)[:, 0]
-    q_d = mx.sum(
-        mx.where(cand == draft_tokens[:, None], q_rows, 0.0), axis=-1
-    )
+    q_d = mx.sum(mx.where(cand == draft_tokens[:, None], q_rows, 0.0), axis=-1)
     ratio = p_d / mx.maximum(q_d, 1e-30)
     accept = u_accept < mx.minimum(1.0, ratio)
     accept_len = _leading_true(accept)

@@ -13,11 +13,7 @@ import mlx.core as mx
 
 
 def is_noop(top_k: int, top_p: float, min_p: float, vocab_size: int) -> bool:
-    return (
-        int(top_k) >= int(vocab_size)
-        and float(top_p) >= 1.0
-        and float(min_p) <= 0.0
-    )
+    return int(top_k) >= int(vocab_size) and float(top_p) >= 1.0 and float(min_p) <= 0.0
 
 
 def normalize_rows(probs: mx.array) -> mx.array:

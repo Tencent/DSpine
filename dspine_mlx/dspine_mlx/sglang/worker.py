@@ -55,9 +55,7 @@ class DSpineMlxWorker(BaseSpecWorker):
         self._states: dict[str, _ReqState] = {}
         self.block_size = int(server_args.speculative_num_draft_tokens)
         self._prof = make_profiler_from_env()
-        self._rng_key = mx.random.key(
-            int(getattr(server_args, "random_seed", 0) or 0)
-        )
+        self._rng_key = mx.random.key(int(getattr(server_args, "random_seed", 0) or 0))
         self._deterministic = _deterministic_inference()
 
         layout = self._runner._cache_layout
@@ -202,9 +200,7 @@ class DSpineMlxWorker(BaseSpecWorker):
             raise RuntimeError("DSPINE MLX prefill produced no next token")
 
         for i, (req, record) in enumerate(zip(batch.reqs, records)):
-            hidden = mx.concatenate(
-                [record[lid] for lid in self._capture_ids], axis=-1
-            )
+            hidden = mx.concatenate([record[lid] for lid in self._capture_ids], axis=-1)
             mx.eval(hidden)
             state = self._states.get(req.rid)
             if state is None:
@@ -345,9 +341,7 @@ class DSpineMlxWorker(BaseSpecWorker):
             draft_lists = drafts.tolist()
         commit_lens = [int(a) + 1 for a in accept_list]
         new_bonus = [int(b) for b in bonus_list]
-        keep_lens = [
-            prefix_lens[i] + commit_lens[i] for i in range(len(batch.reqs))
-        ]
+        keep_lens = [prefix_lens[i] + commit_lens[i] for i in range(len(batch.reqs))]
 
         with self._phase("rollback"):
             rollback_caches(caches, keep_lens)
@@ -420,15 +414,11 @@ class DSpineMlxWorker(BaseSpecWorker):
 
         n = int(drafts.shape[1])
         splits = [mx.random.split(k, 3) for k in verify_keys]
-        u_accept = mx.stack(
-            [mx.random.uniform(key=s[0], shape=(n,)) for s in splits]
-        )
+        u_accept = mx.stack([mx.random.uniform(key=s[0], shape=(n,)) for s in splits])
         u_final = mx.stack([mx.random.uniform(key=s[1]) for s in splits])
         u_res = mx.stack([mx.random.uniform(key=s[2]) for s in splits])
         inv = mx.array([float(s.inv_temp) for s in samplings], dtype=mx.float32)
-        topk = mx.array(
-            [int(s.target_top_k) for s in samplings], dtype=mx.int32
-        )
+        topk = mx.array([int(s.target_top_k) for s in samplings], dtype=mx.int32)
         topp = mx.array([float(s.top_p) for s in samplings], dtype=mx.float32)
         minp = mx.array([float(s.min_p) for s in samplings], dtype=mx.float32)
         vocab = int(logits.shape[-1])
@@ -469,9 +459,7 @@ class DSpineMlxWorker(BaseSpecWorker):
             next_token_ids=empty_long,
             accept_lens=torch.empty((0,), dtype=torch.int32),
             new_seq_lens=empty_lens,
-            next_draft_input=make_draft_input(
-                empty_long, empty_lens, self.block_size
-            ),
+            next_draft_input=make_draft_input(empty_long, empty_lens, self.block_size),
             speculative_num_draft_tokens=self.block_size,
             can_run_cuda_graph=False,
         )

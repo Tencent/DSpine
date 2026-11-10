@@ -92,9 +92,7 @@ def filter_target_probs(
     before = mx.take_along_axis(before_sorted, rank, axis=-1)
     keep = (rank < int(top_k)) & (before <= float(top_p))
     if min_p > 0:
-        keep = keep & (
-            probs >= float(min_p) * mx.max(probs, axis=-1, keepdims=True)
-        )
+        keep = keep & (probs >= float(min_p) * mx.max(probs, axis=-1, keepdims=True))
     w = mx.where(keep, probs, 0.0)
     return w / mx.sum(w, axis=-1, keepdims=True)
 
@@ -195,15 +193,11 @@ class RefinementTail:
         cand = self.candidates(rows)
 
         head_rows = self.head.rows(cand).astype(mx.float32)  # [n,K,H]
-        base = mx.sum(
-            (raw[:, None, :] * self.norm_w) * head_rows, axis=-1
-        )  # [n,K]
+        base = mx.sum((raw[:, None, :] * self.norm_w) * head_rows, axis=-1)  # [n,K]
 
         anchor_arr = mx.full((1, self.k), int(anchor), dtype=mx.int32)
         sid = (
-            mx.concatenate([anchor_arr, cand[:-1]], axis=0)
-            if n > 1
-            else anchor_arr
+            mx.concatenate([anchor_arr, cand[:-1]], axis=0) if n > 1 else anchor_arr
         )  # [n,K]
         tsv_sid = self.tsv[sid].astype(mx.float32)  # [n,K,2R]
         tvg = tsv_sid[..., : self.rank]
@@ -225,13 +219,9 @@ class RefinementTail:
 
         anchor_arr = mx.full((1, self.k), int(anchor), dtype=mx.int32)
         sid = (
-            mx.concatenate([anchor_arr, cand[:-1]], axis=0)
-            if n > 1
-            else anchor_arr
+            mx.concatenate([anchor_arr, cand[:-1]], axis=0) if n > 1 else anchor_arr
         )  # [n,K]
-        e = (
-            self.sqrt_c * self.codebook[sid].astype(mx.float32)
-        )  # [n,K,C]
+        e = self.sqrt_c * self.codebook[sid].astype(mx.float32)  # [n,K,C]
         gate = mx.sigmoid(
             q[:, None, :] + mx.matmul(e, self.pred_gate_w.T) + self.gate_b
         )  # [n,K,R]

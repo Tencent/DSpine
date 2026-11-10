@@ -30,7 +30,7 @@ class KernelConfig:
     # Disable every optimization that is not bit-exact.
     strict: bool = False
 
-    def without_inexact(self) -> "KernelConfig":
+    def without_inexact(self) -> KernelConfig:
         """Return a config that only uses bit-exact paths."""
         return replace(
             self,
@@ -100,6 +100,7 @@ def from_env() -> KernelConfig:
 
 def batch_limits() -> tuple[int, int]:
     """``(max_prefix, max_spread)`` for the batched draft backbone."""
+
     def _int(name: str, default: int) -> int:
         try:
             return int(os.environ.get(name, default))

@@ -16,7 +16,7 @@ import math
 
 import mlx.core as mx
 
-from .common import as_f32, make_kernel
+from .common import as_f32
 
 _F32_TINY = 1.1754943508222875e-38
 
@@ -212,8 +212,12 @@ def prepare_read(
     res = x if residual is None else residual
     raw, normalized, rms = _get("prepare")(
         inputs=[x, res, as_f32(eps)],
-        template=[("H", int(h)), ("NT", int(nt)), ("PT", _per_thread(h, nt)),
-                  ("ADD", bool(add))],
+        template=[
+            ("H", int(h)),
+            ("NT", int(nt)),
+            ("PT", _per_thread(h, nt)),
+            ("ADD", bool(add)),
+        ],
         grid=(m * nt, 1, 1),
         threadgroup=(nt, 1, 1),
         output_shapes=[(m, h), (m, h), (m,)],
@@ -234,8 +238,13 @@ def normalize_codes(
     m, c = projected.shape
     (codes,) = _get("normalize")(
         inputs=[projected, codebook, anchors.astype(mx.int32), as_f32(eps)],
-        template=[("C", int(c)), ("BT", int(block_size)), ("NT", int(nt)),
-                  ("PT", _per_thread(c, nt)), ("ANCHOR_ROW", True)],
+        template=[
+            ("C", int(c)),
+            ("BT", int(block_size)),
+            ("NT", int(nt)),
+            ("PT", _per_thread(c, nt)),
+            ("ANCHOR_ROW", True),
+        ],
         grid=(m * nt, 1, 1),
         threadgroup=(nt, 1, 1),
         output_shapes=[(m, c)],
@@ -275,9 +284,14 @@ def feature_finish(
     m, h = raw.shape
     out, normed = _get("finish")(
         inputs=[raw, delta, rms, weight, as_f32(norm_eps)],
-        template=[("H", int(h)), ("BT", int(block_size)), ("NT", int(nt)),
-                  ("PT", _per_thread(h, nt)), ("WRITE", bool(write)),
-                  ("NORM", bool(norm))],
+        template=[
+            ("H", int(h)),
+            ("BT", int(block_size)),
+            ("NT", int(nt)),
+            ("PT", _per_thread(h, nt)),
+            ("WRITE", bool(write)),
+            ("NORM", bool(norm)),
+        ],
         grid=(m * nt, 1, 1),
         threadgroup=(nt, 1, 1),
         output_shapes=[(m, h), (m, h)],

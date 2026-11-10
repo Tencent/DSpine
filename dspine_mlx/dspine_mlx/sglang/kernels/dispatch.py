@@ -92,9 +92,7 @@ def serial_sample_chain(
     if isinstance(inv_temp, mx.array) or isinstance(top_k, mx.array):
         # The reference implementation is per-request; disallow batched calls.
         if block_size is not None and int(block_size) > 2:
-            raise ValueError(
-                "batched serial_sample_chain requires the MSL kernel"
-            )
+            raise ValueError("batched serial_sample_chain requires the MSL kernel")
     return reference.serial_sample_chain(
         table,
         cand,

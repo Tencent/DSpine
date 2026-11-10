@@ -91,9 +91,7 @@ def register() -> None:
             "environment, not both."
         )
 
-    HookRegistry.register(
-        _ATTENTION_TARGET, _around_attention, HookType.AROUND
-    )
+    HookRegistry.register(_ATTENTION_TARGET, _around_attention, HookType.AROUND)
     HookRegistry.register(_VALIDATE_TARGET, _around_validate, HookType.AROUND)
     HookRegistry.register(_RELEASE_TARGET, _after_release, HookType.AFTER)
 

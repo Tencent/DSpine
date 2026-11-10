@@ -16,9 +16,7 @@ def _leading_true_rows(mask: mx.array) -> mx.array:
     """Length of the leading True run on the last axis of ``[B, n]``."""
     if mask.size == 0:
         return mx.zeros((mask.shape[0],), dtype=mx.int32)
-    return mx.sum(mx.cumprod(mask.astype(mx.int32), axis=-1), axis=-1).astype(
-        mx.int32
-    )
+    return mx.sum(mx.cumprod(mask.astype(mx.int32), axis=-1), axis=-1).astype(mx.int32)
 
 
 def greedy_verify_batched(
@@ -89,9 +87,7 @@ def sampled_verify_batched(
     """
     batch, _T, V = logits.shape
     n = draft_tokens.shape[1]
-    probs = mx.softmax(
-        logits.astype(mx.float32) * inv_temp[:, None, None], axis=-1
-    )
+    probs = mx.softmax(logits.astype(mx.float32) * inv_temp[:, None, None], axis=-1)
     p = filter_target_probs_batched(
         probs,
         top_k,
@@ -100,12 +96,8 @@ def sampled_verify_batched(
         skip_noop=skip_noop,
         apply_min_p=apply_min_p,
     )  # [B, T, V]
-    p_d = mx.take_along_axis(p[:, :n], draft_tokens[:, :, None], axis=-1)[
-        :, :, 0
-    ]
-    q_d = mx.sum(
-        mx.where(cand == draft_tokens[:, :, None], q_rows, 0.0), axis=-1
-    )
+    p_d = mx.take_along_axis(p[:, :n], draft_tokens[:, :, None], axis=-1)[:, :, 0]
+    q_d = mx.sum(mx.where(cand == draft_tokens[:, :, None], q_rows, 0.0), axis=-1)
     ratio = p_d / mx.maximum(q_d, 1e-30)
     accept = u_accept < mx.minimum(1.0, ratio)
     accept_len = _leading_true_rows(accept)
@@ -114,17 +106,11 @@ def sampled_verify_batched(
         mx.zeros((batch, n, V), dtype=mx.float32), cand, q_rows, axis=2
     )
     res_row = mx.minimum(accept_len, n - 1)
-    p_res = mx.take_along_axis(
-        p[:, :n], res_row[:, None, None], axis=1
-    )[:, 0, :]
-    q_res = mx.take_along_axis(
-        q_dense, res_row[:, None, None], axis=1
-    )[:, 0, :]
+    p_res = mx.take_along_axis(p[:, :n], res_row[:, None, None], axis=1)[:, 0, :]
+    q_res = mx.take_along_axis(q_dense, res_row[:, None, None], axis=1)[:, 0, :]
     residual = mx.maximum(p_res - q_res, 0.0)
     residual = residual / mx.sum(residual, axis=-1, keepdims=True)
     bonus_res = _sample_rows(residual, u_res)
     bonus_final = _sample_rows(p[:, n], u_final)
-    bonus = mx.where(
-        accept_len == n, bonus_final, bonus_res
-    ).astype(mx.int32)
+    bonus = mx.where(accept_len == n, bonus_final, bonus_res).astype(mx.int32)
     return accept_len, bonus
