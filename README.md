@@ -127,6 +127,19 @@ sglang serve \
   --trust-remote-code
 ```
 
+For larger TP1 decode batches, increase both `--max-running-requests` and the
+decode graph limit, for example to `32`, and increase `--max-mamba-cache-size`
+(the batch-32 serving test uses `256`). This pool also holds prefix-cache and
+speculative state slots, so too few slots can limit actual concurrency even when
+the request limit is higher. Batches above eight verify the full
+16-token block and use the native ReplaySSM and target-sampling fallbacks.
+Sampled draft proposals reuse the same factorized probability calculation in
+chunks of at most eight requests; they do not require a proposal graph for every
+batch size. The existing SPS policy still applies to batches of at most eight.
+Size the KV/state caches and memory fraction for the workload, and benchmark
+throughput and latency at the intended concurrency. Tensor parallelism remains
+limited to TP1.
+
 ## Apple Silicon (MLX)
 
 Install with `pip install -e dspine_mlx`. See the [MLX guide](dspine_mlx/README.md)

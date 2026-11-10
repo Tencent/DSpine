@@ -552,10 +552,6 @@ class DSpineWorkerV2(DFlashWorkerV2):
         dm.dspine_sampler = self._dspine_sampler
         self.target_distribution = None
         if self._dspine_sampler.optimized:
-            if max_bs > 8:
-                raise ValueError(
-                    "Qwen3.8-27B DSpine supports at most eight concurrent requests"
-                )
             from sglang_dspine.sampling.target import TargetDistribution
 
             self.target_distribution = TargetDistribution(self)
