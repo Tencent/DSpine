@@ -11,6 +11,7 @@ dist/
 .ssh/
 .venv*/
 checkpoints/
+/scratch/
 
 # Local-only MLX development files (not part of the release)
 /dspine_mlx/data/
