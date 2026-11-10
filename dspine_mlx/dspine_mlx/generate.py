@@ -30,7 +30,11 @@ class GenStats:
 
     @property
     def decode_tps(self) -> float:
-        return self.generated_tokens / self.decode_seconds if self.decode_seconds > 0 else 0.0
+        return (
+            self.generated_tokens / self.decode_seconds
+            if self.decode_seconds > 0
+            else 0.0
+        )
 
     @property
     def accepted_per_round(self) -> float:
@@ -41,7 +45,9 @@ class GenStats:
         return self.committed_tokens / self.rounds if self.rounds else 0.0
 
 
-def _sample_target(logits: mx.array, inv_temp: float, top_k: int, top_p: float, min_p: float) -> int:
+def _sample_target(
+    logits: mx.array, inv_temp: float, top_k: int, top_p: float, min_p: float
+) -> int:
     probs = mx.softmax(logits.astype(mx.float32) * float(inv_temp), axis=-1)
     probs = filter_target_probs(probs[None], top_k, top_p, min_p)[0]
     u = mx.random.uniform()
@@ -49,7 +55,14 @@ def _sample_target(logits: mx.array, inv_temp: float, top_k: int, top_p: float, 
 
 
 class DSpineGenerator:
-    def __init__(self, target: TargetAdapter, draft, *, block_size: int | None = None, profile: bool = False):
+    def __init__(
+        self,
+        target: TargetAdapter,
+        draft,
+        *,
+        block_size: int | None = None,
+        profile: bool = False,
+    ):
         if target.vocab_size != draft.vocab_size:
             raise ValueError(
                 f"target vocab {target.vocab_size} != draft vocab {draft.vocab_size}"
@@ -118,9 +131,7 @@ class DSpineGenerator:
         if greedy:
             anchor = int(mx.argmax(logits[0, -1]).item())
         else:
-            anchor = _sample_target(
-                logits[0, -1], inv_temp, target_top_k, top_p, min_p
-            )
+            anchor = _sample_target(logits[0, -1], inv_temp, target_top_k, top_p, min_p)
         tokens = [anchor]
         done = anchor in stop or len(tokens) >= max_tokens
 
@@ -199,9 +210,7 @@ class DSpineGenerator:
             new_tokens = draft_list[:accept_i] + [bonus_i]
             new_tokens = new_tokens[: max_tokens - len(tokens)]
 
-            eos_at = next(
-                (i for i, t in enumerate(new_tokens) if t in stop), None
-            )
+            eos_at = next((i for i, t in enumerate(new_tokens) if t in stop), None)
             if eos_at is not None:
                 new_tokens = new_tokens[: eos_at + 1]
                 done = True
@@ -275,9 +284,7 @@ def baseline_generate(
         if greedy:
             token = int(mx.argmax(logits[0, -1]).item())
         else:
-            token = _sample_target(
-                logits[0, -1], inv_temp, target_top_k, top_p, min_p
-            )
+            token = _sample_target(logits[0, -1], inv_temp, target_top_k, top_p, min_p)
         tokens.append(token)
     stats.generated_tokens = len(tokens)
     stats.decode_seconds = time.perf_counter() - t0

@@ -7,7 +7,6 @@ from unittest import mock
 
 import pytest
 import torch
-from ref_utils import sampling_info
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -15,6 +14,8 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 from sglang_dspine.models.dspine import DSpineCodeBridge
 from sglang_dspine.runtime.graph_runner import DSpineDraftCudaGraphRunner
 from sglang_dspine.runtime.worker import DSpineDraftSampler, DSpineWorkerV2
+
+from ref_utils import sampling_info
 
 
 def _graph_runner(sampler):

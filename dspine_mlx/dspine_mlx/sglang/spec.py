@@ -48,9 +48,7 @@ class DSpineMlxDraftInput(DFlashDraftInputV2):
             raise ValueError("DSpineMlxDraftInput.block_size was not set")
         page_size = int(batch.token_to_kv_pool_allocator.page_size)
         if page_size != 1:
-            raise ValueError(
-                f"DSPINE MLX requires page_size == 1, got {page_size}."
-            )
+            raise ValueError(f"DSPINE MLX requires page_size == 1, got {page_size}.")
 
         committed: list[int] = []
         cur: list[int] = []
@@ -78,9 +76,7 @@ class DSpineMlxDraftInput(DFlashDraftInputV2):
                     ]
                 offset += n
             for i, req in enumerate(batch.reqs):
-                req.kv.kv_allocated_len = max(
-                    int(req.kv.kv_allocated_len), reserved[i]
-                )
+                req.kv.kv_allocated_len = max(int(req.kv.kv_allocated_len), reserved[i])
 
         for req in batch.reqs:
             req.decode_batch_idx += 1
@@ -160,17 +156,25 @@ class DSpineMlxSpecAlgo(CustomSpecAlgo):
         if getattr(cfg, "enable_dp_attention", False):
             raise ValueError("DSPINE MLX does not support DP attention.")
         if getattr(cfg, "disaggregation_mode", "null") != "null":
-            raise ValueError("DSPINE MLX does not support prefill/decode disaggregation.")
+            raise ValueError(
+                "DSPINE MLX does not support prefill/decode disaggregation."
+            )
         if getattr(cfg, "speculative_draft_window_size", None) is not None:
-            raise ValueError("DSPINE MLX does not support --speculative-draft-window-size.")
+            raise ValueError(
+                "DSPINE MLX does not support --speculative-draft-window-size."
+            )
         if getattr(cfg, "enable_hierarchical_cache", False):
             raise ValueError("DSPINE MLX does not support hierarchical cache.")
         if getattr(cfg, "enable_two_batch_overlap", False):
             raise ValueError("DSPINE MLX does not support two-batch overlap.")
         if getattr(cfg, "speculative_adaptive", False):
-            raise ValueError("DSPINE MLX does not support adaptive speculative decoding.")
+            raise ValueError(
+                "DSPINE MLX does not support adaptive speculative decoding."
+            )
         if getattr(cfg, "enable_linear_replayssm_spec", False):
-            raise ValueError("DSPINE MLX does not support --enable-linear-replayssm-spec.")
+            raise ValueError(
+                "DSPINE MLX does not support --enable-linear-replayssm-spec."
+            )
         if getattr(cfg, "kv_cache_dtype", None) in ("nvfp4", "fp4_mx_block16"):
             raise ValueError("DSPINE MLX does not support FP4 KV cache.")
         if getattr(cfg, "lora_paths", None):

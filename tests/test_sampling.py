@@ -5,10 +5,11 @@ import types
 
 import pytest
 import torch
-from ref_utils import ref_target_row, sampling_info
 
 from sglang_dspine.models.dspine import resolve_dspine_head_topk
 from sglang_dspine.runtime.worker import build_dspine_target_probs
+
+from ref_utils import ref_target_row, sampling_info
 
 
 def _build(logits, T, info, backend):

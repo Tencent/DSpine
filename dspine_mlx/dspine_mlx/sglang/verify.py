@@ -22,16 +22,18 @@ import mlx.core as mx
 _verify_ctx = threading.local()
 
 # A/B escape hatch: the pre-E1/E2 pad+concat path, kept for parity checks.
-_LEGACY_VERIFY = os.environ.get(
-    "DSPINE_MLX_NO_VERIFY_FASTPATH", ""
-) in ("1", "true", "True")
+_LEGACY_VERIFY = os.environ.get("DSPINE_MLX_NO_VERIFY_FASTPATH", "") in (
+    "1",
+    "true",
+    "True",
+)
 
 
-def set_verify_context(ctx: "VerifyContext | None") -> None:
+def set_verify_context(ctx: VerifyContext | None) -> None:
     _verify_ctx.ctx = ctx
 
 
-def get_verify_context() -> "VerifyContext | None":
+def get_verify_context() -> VerifyContext | None:
     return getattr(_verify_ctx, "ctx", None)
 
 
@@ -67,8 +69,7 @@ class VerifyContext:
         idx = mx.arange(self.max_len)
         valid = idx[None, :] < (self.offsets[:, None] + int(self.num_tokens))
         causal = idx[None, None, :] <= (
-            self.offsets[:, None, None]
-            + mx.arange(int(self.num_tokens))[None, :, None]
+            self.offsets[:, None, None] + mx.arange(int(self.num_tokens))[None, :, None]
         )
         self.attn_mask = (valid[:, None, :] & causal)[:, None, :, :]
 
@@ -164,17 +165,11 @@ def _batched_verify_attention(wrapper: Any, x: mx.array, ctx: VerifyContext):
         all_v: list[mx.array] = []
         for i, lens in enumerate(ctx.prefix_lens):
             cache_i = ctx.caches[i][layer_idx]
-            k_i, v_i = cache_i.update_and_fetch(
-                keys[i : i + 1], values[i : i + 1]
-            )
+            k_i, v_i = cache_i.update_and_fetch(keys[i : i + 1], values[i : i + 1])
             pad = max_len - (lens + T)
             if pad > 0:
-                k_pad = mx.zeros(
-                    (1, n_kv_heads, pad, head_dim), dtype=k_i.dtype
-                )
-                v_pad = mx.zeros(
-                    (1, n_kv_heads, pad, head_dim), dtype=v_i.dtype
-                )
+                k_pad = mx.zeros((1, n_kv_heads, pad, head_dim), dtype=k_i.dtype)
+                v_pad = mx.zeros((1, n_kv_heads, pad, head_dim), dtype=v_i.dtype)
                 k_i = mx.concatenate([k_i, k_pad], axis=2)
                 v_i = mx.concatenate([v_i, v_pad], axis=2)
             all_k.append(k_i)
@@ -191,9 +186,7 @@ def _batched_verify_attention(wrapper: Any, x: mx.array, ctx: VerifyContext):
         # One zero buffer per layer plus direct slice writes; the legacy path
         # allocated and concatenated a pad tensor per request per layer.
         keys_b = mx.zeros((B, n_kv_heads, max_len, head_dim), dtype=keys.dtype)
-        values_b = mx.zeros(
-            (B, n_kv_heads, max_len, head_dim), dtype=values.dtype
-        )
+        values_b = mx.zeros((B, n_kv_heads, max_len, head_dim), dtype=values.dtype)
         for i, lens in enumerate(ctx.prefix_lens):
             cache_i = ctx.caches[i][layer_idx]
             cache_i.update_and_fetch(keys[i : i + 1], values[i : i + 1])

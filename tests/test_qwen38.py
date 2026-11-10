@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+
 from ref_utils import sampling_info
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
