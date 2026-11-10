@@ -3,7 +3,9 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: ^(License.txt|THIRD_PARTY_NOTICES.txt)$
       - id: end-of-file-fixer
+        exclude: ^(License.txt|THIRD_PARTY_NOTICES.txt)$
       - id: check-yaml
       - id: check-toml
       - id: check-ast
@@ -11,13 +13,15 @@ repos:
     rev: 7.0.0
     hooks:
       - id: isort
+        args: [--settings-path=pyproject.toml]
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.1
     hooks:
       - id: ruff
-        args: [--select=F401,F821,F823,UP037, --fix]
+        args: ["--select=F401,F821,F823,UP037", --fix]
       - id: ruff-format
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
       - id: codespell
+        args: ["--ignore-words-list=nd,thi,mis"]

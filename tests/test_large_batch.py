@@ -95,9 +95,10 @@ def test_large_proposal_fallback_keeps_cache_integrity_checks():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_proposal_graphs_and_large_eager_batches_match_direct_refinement():
+@pytest.mark.parametrize("capacity", [4, 32])
+def test_proposal_graphs_and_large_eager_batches_match_direct_refinement(capacity):
     torch.manual_seed(42)
-    capacity, h, r, c, v, k = 32, 64, 8, 16, 64, 16
+    h, r, c, v, k = 64, 8, 16, 64, 16
     rand = lambda *shape: torch.randn(shape, device="cuda") * 0.1
     bridge = SimpleNamespace(codebook=rand(v, c).bfloat16())
     sampler = SimpleNamespace(
@@ -117,10 +118,12 @@ def test_proposal_graphs_and_large_eager_batches_match_direct_refinement():
         candidate_out=torch.randint(v, (capacity, 15, k), device="cuda"),
     )
     cache = ProposalGraphs(sampler)
-    assert set(cache.entries) == set(range(1, 9))
+    assert set(cache.entries) == set(range(1, min(8, capacity) + 1))
     # Exercise both transitions and different tail chunks; mutate live inputs
     # after capture so replay cannot pass by returning startup's cached values.
-    for bs in (1, 8, 9, 16, 17, 32, 9, 8, 1):
+    for bs in (1, 4, 8, 9, 16, 17, 32, 9, 8, 4, 1):
+        if bs > capacity:
+            continue
         sampler.raw.uniform_(-0.1, 0.1)
         sampler.anchors.random_(v)
         actual = cache.lookup(bs)
