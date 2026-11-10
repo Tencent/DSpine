@@ -6,13 +6,22 @@ for partial work; use `Fixes #N` only when the issue is fully resolved.
 
 ## Local checks
 
-The repository already provides shared Git hooks:
+The repository already provides shared Git hooks. Pre-commit 4.7.0 requires
+Python 3.11 or newer. Check the interpreter version first; some Linux hosts still
+provide Python 3.9 as `python3`. Use an available Python 3.11+ interpreter to
+create a dedicated hook environment, for example:
 
 ```bash
-python -m pip install pre-commit
-pre-commit install
-pre-commit run --all-files
+python3.12 --version
+python3.12 -m venv .venv-hooks
+.venv-hooks/bin/python -m pip install pre-commit==4.7.0
+.venv-hooks/bin/python -m pre_commit install
+.venv-hooks/bin/python -m pre_commit run --all-files
 ```
+
+Replace `python3.12` with the path to your installed Python 3.11+ interpreter.
+Keep `.venv-hooks` after installation: the Git hook records its interpreter path,
+so commits do not require activating the environment. It is already gitignored.
 
 Hooks check formatting, imports, undefined names, spelling, YAML and TOML.
 GitHub Actions runs the same checks on PRs, so checks also run for contributors
