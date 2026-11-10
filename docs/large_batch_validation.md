@@ -1,0 +1,63 @@
+# TP1 large-batch validation
+
+Validated on 2026-11-10 with an NVIDIA H200, Python 3.12.10, SGLang 0.5.22,
+PyTorch 2.14.1 and FlashInfer 0.7.1. The target was the local BF16 Qwen3.8-27B
+checkpoint; the draft was the Qwen3.8-27B-DSpine-b16 release export dated
+2026-11-07. The base repository revision was `321b0fc`.
+
+## Behavior
+
+The request-capacity restriction of eight is removed for TP1. Small sampled
+batches keep their captured proposal graphs. Larger sampled batches compute the
+same factorized conditional logits eagerly in chunks of at most eight requests,
+reusing the existing workspace. No workspace or graph is retained for every
+possible large batch size. Cache mutation and inference-stream checks remain.
+
+Above batch eight, verification uses the complete B16 envelope. The existing
+target-sampling and ReplaySSM eligibility checks select their native fallbacks.
+TP greater than one remains unsupported.
+
+## Numerical and routing tests
+
+The full test suite passed: **125 passed, 6 skipped**. The skipped cases were the
+two opt-in server modules (run separately where applicable) and four
+Triton-interpreter-only cases. The dependency-free hosted-CI selection also
+passed: **10 passed, 7 deselected**. All repository pre-commit checks passed.
+
+`tests/test_large_batch.py` compares captured and eager proposal tables against
+direct FP64 refinement, including live-input changes after capture, batch 9, 16,
+17 and 32, and transitions back to small batches. It also covers sampler capacity
+below eight, full-width verification, sparse-target bypass, native ReplaySSM
+dispatch and proposal-cache mutation rejection.
+
+The suite also corrects a pre-existing seeded-sampler integration test that sent
+CPU tensors through FlashInfer's CUDA filters; that CPU test now selects the
+PyTorch backend.
+
+## Real serving test
+
+`tests/test_large_batch_e2e.py` passed with CUDA graphs enabled. For each of greedy,
+sampled and mixed sampling, it submitted batches of 8, 9, 16, 17, 32 and 8:
+18 cases, 270 requests and 17,280 generated tokens. Every request completed its
+64-token budget and reported speculative verification rounds. The sampled cases
+included joint top-k/top-p; mixed cases additionally exercised min-p.
+
+The log confirmed `DSpine eager proposal table: batch=32 chunk=8`, demonstrating
+an actual batch-32 sampled proposal. Request completion also exercised shrinking
+decode batches. An initial run with a 64-slot Mamba pool completed the requests
+but failed this witness because the scheduler admitted smaller batches. The
+passing run used `--max-mamba-cache-size 256`, `--max-running-requests 32`,
+`--cuda-graph-bs-decode 1 2 4 8 16 32`, `--context-length 4096` and
+`--mem-fraction-static 0.75`. State slots include prefix-cache and speculative
+state, so the request limit alone is insufficient to size this pool.
+
+Run the test with the command in [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+## Limits
+
+This is a correctness and serving smoke regression, not a throughput comparison
+against AR or the previous batch-eight configuration. It does not establish
+byte-for-byte agreement across different greedy batch shapes, statistical
+equivalence of complete output distributions, long-context capacity, TP support,
+or GB10 compatibility. Small-batch SPS policy tuning is unchanged; larger-batch
+SPS tuning is a separate performance milestone.

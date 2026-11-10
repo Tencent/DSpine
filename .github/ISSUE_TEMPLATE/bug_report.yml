@@ -1,0 +1,24 @@
+name: Bug report
+description: Report an error or incorrect output.
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include GPU model/count, OS, Python, SGLang, PyTorch and DSpine commit.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the launch command, target/draft checkpoint revisions and a minimal request. Remove credentials and private data.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Include the traceback or relevant logs. For wrong output, include sampling parameters and the target-only comparison if available.
+    validations:
+      required: true

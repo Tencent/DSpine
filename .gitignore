@@ -12,6 +12,7 @@ dist/
 .venv*/
 checkpoints/
 /scratch/
+/validation/large-batch-*/
 
 # Local-only MLX development files (not part of the release)
 /dspine_mlx/data/
