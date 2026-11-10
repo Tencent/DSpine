@@ -17,6 +17,28 @@ Above batch eight, verification uses the complete B16 envelope. The existing
 target-sampling and ReplaySSM eligibility checks select their native fallbacks.
 TP greater than one remains unsupported.
 
+## CUDA Graph boundaries
+
+The large-batch fallback does not disable CUDA Graphs for the entire decoder:
+
+| Stage | Batch above eight |
+| --- | --- |
+| Draft-model forward | Can replay configured model graphs, subject to backend and shape eligibility |
+| Sampled proposal probability table | Eager factorized calculation in chunks of at most eight; no large-batch proposal-table graph |
+| Full B16 target verification | Can replay configured model graphs, subject to backend and shape eligibility |
+| SPS shortened/ragged verification | Not enabled for these larger batches |
+
+Using native ReplaySSM and target-sampling fallbacks does not by itself force
+model forwards into eager mode. Sampling work outside model graphs is a separate
+stage.
+
+The serving log recorded target and draft model graph capture for batch sizes
+`[1, 2, 4, 8, 16, 32]`. Decode traces for actual batches 9, 16 and 17 reported
+`cuda graph: True`. The separate `batch=32 chunk=8` witness establishes an actual
+batch-32 sampled proposal using the eager table path. Per-stage graph replay
+counters for batch 32 were not collected; these observations should not be
+described as an end-to-end graph-only batch-32 execution.
+
 ## Numerical and routing tests
 
 The full test suite passed: **125 passed, 6 skipped**. The skipped cases were the
@@ -52,6 +74,14 @@ passing run used `--max-mamba-cache-size 256`, `--max-running-requests 32`,
 state, so the request limit alone is insufficient to size this pool.
 
 Run the test with the command in [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+Suggested issue update:
+
+> The TP1 large-batch fix has passed H200 validation, including actual batch-32
+> decoding across greedy, sampled, and mixed workloads. For batches above eight,
+> sampled proposal probability tables use an eager chunked fallback; model
+> forwards can still use CUDA Graphs. Large-batch SPS optimization and TP support
+> remain separate follow-ups.
 
 ## Limits
 
