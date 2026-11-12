@@ -695,8 +695,9 @@ class DSpineWorkerV2(DFlashWorkerV2):
 
             runner = self.draft_model_runner
             backend = runner.attn_backend
-            if type(backend) is not FlashAttentionBackend or backend.fa_impl_ver != int(
-                runner.draft_attention_backend[-1]
+            if runner.draft_attention_backend in ("fa3", "fa4") and (
+                type(backend) is not FlashAttentionBackend
+                or backend.fa_impl_ver != int(runner.draft_attention_backend[-1])
             ):
                 raise ValueError(
                     "Native DSPINE SWA candidate requires the resolved FA3/FA4 backend itself"

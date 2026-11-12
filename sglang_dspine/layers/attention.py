@@ -3,7 +3,8 @@
 WINDOW = 8192
 BLOCK_SIZE = 16
 NUM_LAYERS = 5
-BACKENDS = frozenset(("fa3",))
+# No FA3 on sm_12x (GB10): Triton works there; FlashInfer gave garbage output.
+BACKENDS = frozenset(("fa3", "fa4", "triton"))
 
 
 def _get(config, name, default=None):
