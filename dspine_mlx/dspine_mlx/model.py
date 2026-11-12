@@ -35,6 +35,9 @@ class DraftAttention(nn.Module):
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        # None = full attention. Otherwise a query at absolute position p sees
+        # keys p-window+1 .. p (Qwen3.8-27B-DSpine-b16: 8192).
+        self.window = cfg.sliding_window
 
     def __call__(self, x, x_ctx, rope, cache: KVCache | None = None):
         B, L, _ = x.shape
@@ -67,8 +70,6 @@ class DraftAttention(nn.Module):
             else:
                 keys = cache.keys[:, :, :offset, :]
                 values = cache.values[:, :, :offset, :]
-            keys = mx.concatenate([keys, prop_keys], axis=2)
-            values = mx.concatenate([values, prop_values], axis=2)
         else:
             if x_ctx is None:
                 raise ValueError(
@@ -77,15 +78,32 @@ class DraftAttention(nn.Module):
             ctx_keys, ctx_values = self._context_kv(x_ctx, rope, 0)
             queries = rope(queries)
             prop_keys = rope(prop_keys)
-            keys = mx.concatenate([ctx_keys, prop_keys], axis=2)
-            values = mx.concatenate([ctx_values, prop_values], axis=2)
+            keys, values = ctx_keys, ctx_values
+
+        # Context keys sit at positions 0..K-L-1, the block at K-L..K-1.
+        K = keys.shape[2] + L
+        W = self.window
+        if W is None or K <= W:
+            keys = mx.concatenate([keys, prop_keys], axis=2)
+            values = mx.concatenate([values, prop_values], axis=2)
+            mask = "causal"
+        else:
+            # Slice before concatenating so a long context cache is not
+            # copied every round; keys older than the window are never seen.
+            q0 = K - L
+            start = max(0, q0 - (W - 1))
+            keys = mx.concatenate([keys[:, :, start:, :], prop_keys], axis=2)
+            values = mx.concatenate([values[:, :, start:, :], prop_values], axis=2)
+            kpos = mx.arange(start, K)[None, :]
+            qpos = mx.arange(q0, K)[:, None]
+            mask = (kpos <= qpos) & (kpos > qpos - W)
 
         output = mx.fast.scaled_dot_product_attention(
             queries,
             keys,
             values,
             scale=self.scale,
-            mask="causal",
+            mask=mask,
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -207,6 +225,18 @@ class DSpineDraftModel(nn.Module):
             caches = [None] * len(self.layers)
         if len(caches) != len(self.layers):
             raise ValueError("draft cache length != number of draft layers")
+
+        W = self.config.sliding_window
+        if (
+            W is not None
+            and target_hidden is not None
+            and target_hidden.shape[1] > W
+            and all(c is not None and c.offset == 0 for c in caches)
+        ):
+            # A fresh cache only needs the last W context rows: no block query
+            # can see older ones. RoPE is relative and the window mask is
+            # shift-consistent, so this changes nothing but the cost.
+            target_hidden = target_hidden[:, -W:]
 
         x = self._embed_tokens(block_ids)
         if target_hidden is not None:

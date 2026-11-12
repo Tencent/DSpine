@@ -7,6 +7,11 @@ import mlx.nn as nn
 import mlx_lm
 from mlx_lm.models.cache import make_prompt_cache
 
+from .hybrid import install_recording
+
+# Prompt tokens per prefill forward (mlx-lm generate uses 2048 too).
+PREFILL_CHUNK = 2048
+
 
 class HeadAccess:
     """Uniform dense / quantized access to the target LM head.
@@ -131,7 +136,12 @@ def _find_lm_head(model):
 
 
 class TargetAdapter:
-    """An unmodified mlx-lm Qwen3 target plus five hidden-state hooks."""
+    """An mlx-lm target plus hidden-state hooks.
+
+    Pure-attention targets (Qwen3-8B) run unmodified. Hybrid ``qwen3_5``
+    targets (Qwen3.8-27B) get recording GatedDeltaNet layers so that ``trim``
+    can roll their recurrent state back exactly (see ``hybrid.py``).
+    """
 
     def __init__(self, model, tokenizer, target_layer_ids):
         self.model = model
@@ -150,6 +160,9 @@ class TargetAdapter:
         self.lm_head = _find_lm_head(model)
         self.head = HeadAccess(self.lm_head)
         self.cache = None
+        # One entry per cache slot: a recording GatedDeltaNet or None ([] if pure attention).
+        self._linear = install_recording(self.layers)
+        self._verify_steps = 0
 
     @classmethod
     def load(cls, path: str | Path, target_layer_ids) -> "TargetAdapter":
@@ -175,11 +188,42 @@ class TargetAdapter:
         return logits, hidden
 
     def prefill(self, tokens: mx.array, capture: bool = True):
+        """Chunked prefill; returns logits for the last position only.
+
+        A one-shot prefill materialises logits for every prompt position
+        (about 16 GB for 32k tokens and a 248k vocabulary). Chunks whose
+        logits are never evaluated skip the LM head. Hidden features are kept
+        for every position, since the draft needs them.
+        """
         self.cache = make_prompt_cache(self.model)
-        return self._forward(tokens, capture=capture)
+        n = int(tokens.shape[1])
+        hs = []
+        logits = hidden = None
+        for s in range(0, n, PREFILL_CHUNK):
+            logits, hidden = self._forward(tokens[:, s : s + PREFILL_CHUNK], capture=capture)
+            if capture:
+                hs.append(hidden)
+            if s + PREFILL_CHUNK < n:
+                mx.eval([c.state for c in self.cache] + hs[-1:])
+        if capture and len(hs) > 1:
+            hidden = mx.concatenate(hs, axis=1)
+        return logits[:, -1:], hidden
+
+    def _set_recording(self, on: bool) -> None:
+        for mod in self._linear:
+            if mod is not None:
+                mod._box.recording = on
 
     def verify(self, tokens: mx.array, capture: bool = True):
-        return self._forward(tokens, capture=capture)
+        if not self._linear:
+            return self._forward(tokens, capture=capture)
+        self._set_recording(True)
+        try:
+            out = self._forward(tokens, capture=capture)
+        finally:
+            self._set_recording(False)
+        self._verify_steps = int(tokens.shape[1])
+        return out
 
     def step(self, token: int) -> mx.array:
         logits, _ = self._forward(
@@ -188,15 +232,37 @@ class TargetAdapter:
         return logits
 
     def trim(self, n: int) -> None:
+        """Drop the last ``n`` tokens of the preceding verify pass."""
+        if self._linear:
+            return self._trim_hybrid(n)
         if n <= 0:
             return
         for c in self.cache:
             if not c.is_trimmable():
                 raise RuntimeError(
                     f"target cache {type(c).__name__} is not trimmable; "
-                    "the current MLX port supports pure-KV Qwen3-8B only"
+                    "only KV caches and qwen3_5 GatedDeltaNet layers are supported"
                 )
             c.trim(n)
+
+    def _trim_hybrid(self, n: int) -> None:
+        if n <= 0:
+            for mod in self._linear:
+                if mod is not None:
+                    mod._box.record = None
+            return
+        steps = self._verify_steps
+        if steps <= 0 or n >= steps:
+            raise RuntimeError(f"trim({n}) needs a preceding verify of more than {n} tokens")
+        if len(self.cache) != len(self._linear):
+            raise RuntimeError("cache / layer count mismatch")
+        accepted = steps - n
+        for c, mod in zip(self.cache, self._linear):
+            if mod is None:
+                c.trim(n)
+            else:
+                mod.rollback(c, accepted)
+        self._verify_steps = 0
 
     @property
     def vocab_size(self) -> int:

@@ -41,6 +41,8 @@ class DraftConfig:
     feature_layers: tuple[int, ...]  # 0-based draft layer ids
     head_topk: int
     trained_block_size: int
+    # Sliding-window attention over absolute positions (None = full attention).
+    sliding_window: int | None = None
     architectures: tuple[str, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
@@ -229,24 +231,7 @@ class DraftConfig:
         _require(len(set(found)) == 1, f"refinement widths disagree: {found}{where}")
         head_topk = found[0]
 
-        layer_types = raw.get("layer_types")
-        if layer_types is not None:
-            _require(
-                all(t == "full_attention" for t in layer_types),
-                f"DSpine drafts use full attention only{where}",
-            )
-            _require(
-                len(layer_types) == num_layers,
-                f"layer_types length != num_hidden_layers{where}",
-            )
-        _require(
-            not raw.get("use_sliding_window", False),
-            f"DSpine drafts use no sliding window{where}",
-        )
-        _require(
-            raw.get("sliding_window") is None,
-            f"DSpine drafts use no sliding window{where}",
-        )
+        sliding_window = _parse_sliding_window(raw, num_layers, where)
 
         rope_theta = raw.get("rope_theta")
         rope_params = raw.get("rope_parameters")
@@ -284,11 +269,49 @@ class DraftConfig:
             feature_layers=feature_layers,
             head_topk=head_topk,
             trained_block_size=block_size,
+            sliding_window=sliding_window,
             architectures=tuple(raw.get("architectures", ())),
             raw=raw,
         )
         cfg.validate()
         return cfg
+
+
+def _parse_sliding_window(raw: dict, num_layers: int, where: str) -> int | None:
+    """Full attention (None), or one sliding window shared by every draft layer.
+
+    Qwen3.8-27B-DSpine-b16 declares every layer ``sliding_attention`` with an
+    8192 window (served with FlashAttention ``window_left = 8191``): a query at
+    absolute position p sees keys p-8191 .. p. Mixed layer types are rejected.
+    """
+    layer_types = raw.get("layer_types")
+    if layer_types is not None:
+        _require(
+            len(layer_types) == num_layers,
+            f"layer_types length != num_hidden_layers{where}",
+        )
+    use = bool(raw.get("use_sliding_window", False))
+    declares = use or (layer_types is not None and "sliding_attention" in layer_types)
+    if not declares:
+        _require(
+            layer_types is None or all(t == "full_attention" for t in layer_types),
+            f"unsupported layer_types {sorted(set(layer_types or []))}{where}",
+        )
+        _require(
+            raw.get("sliding_window") is None,
+            f"sliding_window is set but use_sliding_window is false{where}",
+        )
+        return None
+    window = raw.get("sliding_window")
+    _require(
+        use
+        and layer_types == ["sliding_attention"] * num_layers
+        and int(raw.get("max_window_layers", num_layers)) == num_layers
+        and type(window) is int
+        and window > 0,
+        f"only one sliding window on every draft layer is supported{where}",
+    )
+    return window
 
 
 def resolve_draft_path(path: str | Path, revision: str | None = None) -> Path:
