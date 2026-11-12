@@ -143,31 +143,25 @@ def test_prefill_samples_the_requested_target_distribution():
     assert torch.max(torch.abs(frequencies - probs[0])) < 0.02
 
 
-def test_seeded_requests_remain_eligible_for_fast_target_probabilities():
+def test_target_distribution_preserves_request_seeds_and_rng():
     from sglang_dspine.sampling.target import TargetDistribution
 
-    info = sampling_info(2, temperature=1.0, top_k=20, top_p=0.95)
-    info.sampling_seed = torch.tensor([7, 9])
-    info.is_any_greedy = info.has_custom_logit_processor = False
-    info.logit_bias = info.grammars = None
-    batch = SimpleNamespace(
-        sampling_info=info,
-        has_grammar=False,
-        return_logprob=False,
-        is_extend_in_batch=False,
-        forward_mode=SimpleNamespace(is_decode=lambda: True),
-        reqs=[
-            SimpleNamespace(
-                sampling_params=SimpleNamespace(
-                    temperature=1.0, top_k=20, top_p=0.95, min_p=0.0
-                )
-            )
-            for _ in range(2)
-        ],
-    )
-    distribution = TargetDistribution(None)
-    distribution.begin(batch)
-    assert distribution.certificate is not None
+    info = sampling_info(17, temperature=0.7, top_k=50, top_p=0.8)
+    info.sampling_seed = torch.arange(17) + 7
+    seeds = info.sampling_seed.clone()
+    logits = torch.zeros(17 * 16, 3)
+    expected = torch.full((17, 16, 3), 1 / 3)
+    distribution = TargetDistribution(SimpleNamespace(block_size=16))
+    rng = torch.get_rng_state().clone()
+    with (
+        patch("sglang_dspine.runtime.worker.build_dspine_target_probs", return_value=expected) as build,
+        patch("sglang.srt.runtime_context.get_exec", return_value=SimpleNamespace(
+            kernel=SimpleNamespace(sampling_backend="pytorch"))),
+    ):
+        assert distribution.dense(logits, info, 17) is expected
+    assert build.call_args.kwargs["sampling_info"] is info
+    assert torch.equal(info.sampling_seed, seeds)
+    assert torch.equal(torch.get_rng_state(), rng)
 
 
 def test_prefill_hook_uses_seeded_sampler_and_preserves_unseeded_dispatch():
@@ -232,7 +226,7 @@ def test_worker_scope_and_registered_prefill_hook_honor_api_seed():
         patch(
             "sglang.srt.runtime_context.get_exec",
             return_value=SimpleNamespace(
-                kernel=SimpleNamespace(sampling_backend="flashinfer")
+                kernel=SimpleNamespace(sampling_backend="pytorch")
             ),
         ),
     ):

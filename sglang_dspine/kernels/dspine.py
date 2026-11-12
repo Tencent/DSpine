@@ -599,8 +599,10 @@ def _serial_sample_chain(
     GreedyTok,
     OutTok,
     OutQ,
+    Confidence,
     K: tl.constexpr,
     TM1: tl.constexpr,
+    WITH_CONFIDENCE: tl.constexpr,
 ):
     b = tl.program_id(0)
     lane = tl.arange(0, K)
@@ -616,6 +618,10 @@ def _serial_sample_chain(
         scores = tl.sum(tl.where(lane[:, None] == sender, table, 0.0), axis=0) * inv_t
         mass = tl.exp(scores - tl.max(scores, axis=0))
         p = mass / tl.sum(mass, axis=0)
+        if WITH_CONFIDENCE:
+            if not greedy:
+                # Actual sampled prefix, before filtering or drawing this token.
+                tl.store(Confidence + n, tl.max(p, axis=0))
         p_c = p[:, None]
         p_d = p[None, :]
         ahead = (p_d > p_c) | (p_d == p_c) & (lane[None, :] < lane[:, None])
@@ -654,12 +660,19 @@ def serial_sample_chain(
     out_tok,
     out_q,
     block_size: int,
+    *,
+    confidence_out=None,
 ):
     """Sample every request's chain (module docstring); fills out_tok[:n] / out_q[:n] in place.
 
     table fp32 [n, K, K]; inv_temp fp32 [>=bs]; top_k int32 [>=bs] (>= 1; >= K disables it);
     top_p fp32 [>=bs] in (0, 1]; min_p fp32 [>=bs] in [0, 1]; greedy int32 [>=bs]; u fp32 [>=n]
     in [0, 1); cand int64 [n, K]; greedy_tok int64 [>=n]; out_tok int64 [>=n]; out_q fp32 [>=n, K].
+
+    Optional confidence_out fp32 [>=n] stores the maximum temperature-softmax
+    probability conditioned on the actual sampled prefix x_<i, before top-k,
+    top-p, and min-p filtering or drawing x_i. Greedy rows retain their existing
+    greedy confidence; tokens, q, and random draws are unchanged.
     """
     t = int(block_size)
     (n, k) = cand.shape
@@ -673,6 +686,15 @@ def serial_sample_chain(
         raise ValueError("serial_sample_chain output buffers too small")
     if not (cand.is_contiguous() and out_q.is_contiguous()):
         raise ValueError("serial_sample_chain expects contiguous candidates and q")
+    if confidence_out is not None and (
+        confidence_out.dtype != torch.float32
+        or confidence_out.numel() < n
+        or not confidence_out.is_contiguous()
+        or confidence_out.device != table.device
+    ):
+        raise ValueError(
+            "serial_sample_chain confidence needs contiguous float32 storage on the table device"
+        )
     dtypes = (
         table.dtype,
         inv_temp.dtype,
@@ -714,8 +736,10 @@ def serial_sample_chain(
             greedy_tok,
             out_tok,
             out_q,
+            confidence_out if confidence_out is not None else out_q,
             K=k,
             TM1=t - 1,
+            WITH_CONFIDENCE=confidence_out is not None,
             num_warps=1,
         )
     return (out_tok, out_q)

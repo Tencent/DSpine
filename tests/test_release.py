@@ -62,24 +62,14 @@ def test_padding_preserves_verified_logits_and_normalizes_unused_rows():
         dict(regex="a+"),
     ],
 )
-def test_neutral_padding_is_disabled_outside_its_sampling_contract(changes):
+def test_neutral_padding_is_independent_of_request_sampling_parameters(changes):
     actual = logits_padding(_controller(**changes), torch.empty(2, 3), (4, 3))
-    assert torch.equal(actual, torch.zeros_like(actual))
+    assert torch.equal(actual.softmax(-1), torch.tensor([[1.0, 0.0, 0.0]]).expand(4, 3))
 
 
-@pytest.mark.parametrize("sm_count", [114, 108])
-def test_unsupported_sparse_geometry_uses_the_native_target_path(sm_count):
-    props = SimpleNamespace(
-        major=9,
-        minor=0,
-        multi_processor_count=sm_count,
-        max_threads_per_multi_processor=2048,
-    )
-    distribution = TargetDistribution(SimpleNamespace(device="cuda"))
-    with (
-        patch.object(torch.cuda, "get_device_properties", return_value=props),
-        patch("sglang_dspine.sampling.target.producer.initialize") as initialize,
+def test_target_initialization_needs_no_device_geometry():
+    with patch.object(
+        torch.cuda, "get_device_properties", side_effect=AssertionError("GPU query")
     ):
-        distribution.prepare(None)
-    assert distribution.graphs is None
-    initialize.assert_not_called()
+        distribution = TargetDistribution(SimpleNamespace(device="cuda"))
+    assert distribution.scratch is None

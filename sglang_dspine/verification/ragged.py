@@ -15,6 +15,19 @@ logger = logging.getLogger(__name__)
 _depth = 0
 
 
+def graph_tokens_for_budget(graph, budget, bs):
+    """Use only an exact token tier with enough request slots; otherwise eager."""
+    if graph is None:
+        return None
+    return next(
+        (
+            tier for tier in graph.capture_num_tokens
+            if tier == budget and graph._ragged_capture_slots(tier) >= bs
+        ),
+        None,
+    )
+
+
 def ragged_active():
     return _depth > 0
 
@@ -69,23 +82,25 @@ class RaggedVerifyCaps(VerifyCaps):
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
-        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-
         if self.full != 16:
             raise ValueError("Ragged verification requires draft block16")
-        self.tokens = self.policy.batch8_tokens
-        self.lens_cpu = [self.tokens // 8] * 8
-        self.layout = RaggedVerifyLayout.from_verify_lens(
-            verify_lens_cpu=self.lens_cpu,
-            device=worker.device,
-            grid=list(range(16, 129, 16)),
-        )
-        self.window_index = torch.tensor(
-            [b * 16 + i for (b, n) in enumerate(self.lens_cpu) for i in range(n)],
-            device=worker.device,
-            dtype=torch.int64,
-        )
-        self.lens_tensor_cpu = torch.tensor(self.lens_cpu, dtype=torch.int64)
+        self.tokens = self.batch_size = 0
+        self.lens_cpu = self.lens_tensor_cpu = None
+        self.ragged_backend = self.ragged_graph = None
+        self.round_graph = None
+        self.graph_tokens = None
+        self.executed_tokens = None
+        self.ragged_round = False
+        self.compact_round = False
+        self.compact_logits = None
+        self.row_to_request = self.row_offsets = None
+        self.max_prefix = None
+        if not any(
+            budget < bs * self.full
+            for mode in ("greedy", "sampled")
+            for bs, budget in self.policy_for_mode(mode).token_budgets.items()
+        ):
+            return
         with ragged_scope():
             old_init = self.runner.init_new_workspace
             try:
@@ -94,38 +109,58 @@ class RaggedVerifyCaps(VerifyCaps):
                 )
             finally:
                 self.runner.init_new_workspace = old_init
-            if not self.ragged_backend.supports_ragged_verify_graph:
-                raise ValueError(
-                    "The configured attention backend does not support ragged graphs"
-                )
+            if (
+                not self.ragged_backend.supports_ragged_verify_graph
+                or self.ragged_backend.needs_cpu_seq_lens
+                or self.states[self.full][0].needs_cpu_seq_lens
+            ):
+                logger.info("DSPine SPS uses full-block verification on this backend")
+                self.ragged_backend = None
+                return
             self.ragged_graph = (
                 DecodeCudaGraphRunner(
                     self.runner,
                     attn_backend=self.ragged_backend,
                     speculative_num_steps=1,
-                    speculative_num_draft_tokens=16,
+                    speculative_num_draft_tokens=self.full,
                 )
-                if self.states[16][1] is not None
+                if self.states[self.full][1] is not None
                 else None
             )
-        self.executed_tokens = None
-        self.ragged_round = False
-        self.max_prefix = None
-        logger.info(
-            "DSPine ragged capture ready: lens=%s tokens=%d graph=%s",
-            self.lens_cpu,
-            self.tokens,
-            self.ragged_graph is not None,
-        )
+        logger.info("DSPine ragged capture ready: graph=%s", self.ragged_graph is not None)
 
     def begin(self, batch):
         super().begin(batch)
         self.executed_tokens = None
+        self.batch_size = batch.batch_size() if self.in_round else 0
+        self.tokens = self.policy.budget(self.batch_size, self.full)
+        self.graph_tokens = graph_tokens_for_budget(
+            self.ragged_graph, self.tokens, self.batch_size
+        )
+        self.round_graph = self.ragged_graph if self.graph_tokens is not None else None
         self.ragged_round = (
-            self.in_round and batch.batch_size() == 8 and self.tokens < 128
+            self.in_round
+            and self.ragged_backend is not None
+            and self.tokens < self.batch_size * self.full
         )
         if self.ragged_round:
             self.active = self.full - 1
+        from sglang_dspine.sampling.compact import can_keep_compact
+
+        self.compact_round = bool(
+            self.ragged_round and self.sampled_round
+            and can_keep_compact(batch.sampling_info)
+        )
+        self.compact_logits = None
+        self.row_to_request = self.row_offsets = None
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            self.compact_round = False
+            self.compact_logits = None
+            self.row_to_request = self.row_offsets = None
 
     def prepare(self, original, verify_input, batch, target_worker, *args, **kwargs):
         if not self.in_round or not self.ragged_round:
@@ -177,7 +212,7 @@ class RaggedVerifyCaps(VerifyCaps):
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         (self.runner.attn_backend, self.runner.decode_cuda_graph_runner) = (
             self.ragged_backend,
-            self.ragged_graph,
+            self.round_graph,
         )
         try:
             with ragged_scope():
@@ -199,15 +234,17 @@ class RaggedVerifyCaps(VerifyCaps):
                 raise RuntimeError(
                     f"Ineffective ragged verify: expected {self.tokens}, got {rows}"
                 )
-            self.executed_tokens = rows
+            self.executed_tokens = self.tokens
             long_prefix = (
                 self.max_prefix >= 8192 if self.max_prefix is not None else None
             )
-            key = (8, rows, long_prefix)
+            key = (self.batch_size, rows, long_prefix)
             self.executed_counts[key] += 1
             if self.executed_counts[key] == 1:
                 logger.info(
-                    "DSPine ragged executed: batch=8 draft=16 actual_rows=%d lens=%s cuda_graph=%s max_prefix=%s long_prefix=%s",
+                    "DSPine ragged executed: batch=%d draft=%d actual_rows=%d lens=%s cuda_graph=%s max_prefix=%s long_prefix=%s",
+                    self.batch_size,
+                    self.full,
                     rows,
                     self.lens_cpu,
                     result.can_run_cuda_graph,
@@ -217,16 +254,25 @@ class RaggedVerifyCaps(VerifyCaps):
             for name in ("next_token_logits", "hidden_states"):
                 value = getattr(output, name)
                 if value is not None:
+                    if name == "next_token_logits" and self.compact_round:
+                        self.compact_logits = value
+                        self.row_offsets = self.layout.qo_indptr_device[:-1]
+                        self.row_to_request = self.window_index.div(
+                            self.full, rounding_mode="floor"
+                        )
+                        continue
                     if name == "next_token_logits":
                         from sglang_dspine.sampling.padding import logits_padding
 
                         padded = logits_padding(
                             self,
                             value,
-                            (8 * 16, value.shape[-1]),
+                            (self.batch_size * self.full, value.shape[-1]),
                         )
                     else:
-                        padded = value.new_zeros((8 * 16, value.shape[-1]))
+                        padded = value.new_zeros(
+                            (self.batch_size * self.full, value.shape[-1])
+                        )
                     padded.index_copy_(0, self.window_index, value)
                     setattr(output, name, padded)
             return result
@@ -252,7 +298,7 @@ class RaggedVerifyCaps(VerifyCaps):
                 prefix_lens=prefix_lens,
                 bs=bs,
             )
-        if bs != 8 or self.executed_tokens != self.tokens:
+        if bs != self.batch_size or self.executed_tokens != self.tokens:
             raise RuntimeError(
                 "Ragged acceptance requires confirmed packed verification"
             )
@@ -267,8 +313,10 @@ class RaggedVerifyCaps(VerifyCaps):
                 prefix_lens=prefix_lens,
                 bs=bs,
                 verify_lens=self.layout.verify_lens,
+                row_offsets=self.row_offsets if self.compact_round else None,
+                row_to_request=self.row_to_request if self.compact_round else None,
             )
-        top1 = next_token_logits.argmax(-1).view(bs, 16)
+        top1 = next_token_logits.argmax(-1).view(bs, self.full)
         (accept, commit, bonus, output, new_seq) = (
             self.worker._next_accept_bonus_buffers(bs)
         )
@@ -282,6 +330,6 @@ class RaggedVerifyCaps(VerifyCaps):
             output,
             prefix_lens,
             new_seq,
-            T=16,
+            T=self.full,
         )
         return (accept, commit, bonus, output, new_seq)

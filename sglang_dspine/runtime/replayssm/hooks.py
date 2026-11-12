@@ -58,7 +58,7 @@ def around_forward(original, runner, batch, *args, **kwargs):
     ):
         return original(runner, batch, *args, **kwargs)
     bs = int(batch.batch_size)
-    if not 1 <= bs <= 8:
+    if bs < 1:
         return original(runner, batch, *args, **kwargs)
     req_pool = runner.req_to_token_pool
     state = req_pool.get_speculative_mamba2_params_all_layers()
@@ -93,7 +93,7 @@ def around_kernel(original, *args, **kwargs):
     values.update(zip(LAUNCH_KEYS, launch))
     values["is_flush_kernel"] = False
     if values.get("scale") is None:
-        values["scale"] = 128**-0.5
+        values["scale"] = values["q"].shape[-1] ** -0.5
     parameters = inspect.signature(_helper).parameters
     _helper(**{name: values[name] for name in parameters})
     return values["out"]

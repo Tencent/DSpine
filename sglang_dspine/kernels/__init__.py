@@ -1,1 +1,1 @@
-"""DSpine numerical kernels and packaged CUDA extensions."""
+"""DSpine numerical kernels."""

@@ -20,4 +20,7 @@ checkpoints/
 /dspine_mlx/comparison_dflash.md
 /dspine_mlx/dspine_mlx/bench.py
 /dspine_mlx/dspine_mlx/sglang/bench_concurrency.py
-/scripts/
+/scripts/*
+!/scripts/tune_sps.py
+!/scripts/sps_search.py
+!/scripts/fit_calibration.py
