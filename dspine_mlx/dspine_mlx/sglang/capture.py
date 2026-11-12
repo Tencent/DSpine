@@ -16,7 +16,7 @@ import mlx.nn as nn
 _session = threading.local()
 
 
-def get_active_session() -> "CaptureSession | None":
+def get_active_session() -> CaptureSession | None:
     return getattr(_session, "active", None)
 
 
@@ -114,7 +114,9 @@ def install_capture_layers(
     if layers is None:
         layers = getattr(model, "layers", None)
     if layers is None:
-        raise AttributeError(f"Cannot find transformer layers in {type(model).__name__}")
+        raise AttributeError(
+            f"Cannot find transformer layers in {type(model).__name__}"
+        )
 
     installed: list[int] = []
     wrappers: list[LayerCapture] = []

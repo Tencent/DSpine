@@ -113,18 +113,16 @@ class DSpineCodeBridge(nn.Module):
         rms = mx.sqrt(mx.maximum(mx.mean(f * f, axis=-1), _F32_TINY))  # [B,T]
         normalized = (f / (rms[..., None] + self.eps)).astype(mx.bfloat16)
 
-        projected = mx.matmul(
-            normalized, self.layer_read_weight(layer).T
-        ).astype(mx.float32)
+        projected = mx.matmul(normalized, self.layer_read_weight(layer).T).astype(
+            mx.float32
+        )
         proj_norm = mx.sqrt(mx.sum(projected * projected, axis=-1, keepdims=True))
-        codes = (
-            sqrt_c * projected / (proj_norm + self.eps)
-        ).astype(mx.bfloat16)
+        codes = (sqrt_c * projected / (proj_norm + self.eps)).astype(mx.bfloat16)
 
         anchors = input_ids[:, 0]
-        anchor_codes = (
-            sqrt_c * self.codebook[anchors].astype(mx.float32)
-        ).astype(mx.bfloat16)
+        anchor_codes = (sqrt_c * self.codebook[anchors].astype(mx.float32)).astype(
+            mx.bfloat16
+        )
         codes = mx.concatenate([anchor_codes[:, None, :], codes[:, 1:, :]], axis=1)
 
         packed = mx.matmul(codes, self.packed_weight.T)  # [B,T,3R] bf16
@@ -140,26 +138,26 @@ class DSpineCodeBridge(nn.Module):
             [self.rank, 2 * self.rank],
             axis=-1,
         )
-        gate = mx.sigmoid(q[:, 1:, :] + s[:, :-1, :] + self.gate.bias.astype(mx.float32))
+        gate = mx.sigmoid(
+            q[:, 1:, :] + s[:, :-1, :] + self.gate.bias.astype(mx.float32)
+        )
         message = mx.concatenate(
             [mx.zeros_like(q[:, :1, :]), gate * v[:, :-1, :]], axis=1
         ).astype(mx.bfloat16)
-        delta = mx.matmul(
-            message, self.feature_write_weights[layer].T
-        ).astype(mx.float32)
-
-        not_anchor = (
-            (mx.arange(m).reshape(B, T) % T != 0).astype(mx.float32)[..., None]
+        delta = mx.matmul(message, self.feature_write_weights[layer].T).astype(
+            mx.float32
         )
+
+        not_anchor = (mx.arange(m).reshape(B, T) % T != 0).astype(mx.float32)[..., None]
         out = (f + (rms[..., None] * delta) * not_anchor).astype(mx.bfloat16)
 
         x = out.astype(mx.float32)
         y = (
             x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + next_norm.eps)
         ).astype(mx.bfloat16)
-        normed = (
-            y.astype(mx.float32) * next_norm.weight.astype(mx.float32)
-        ).astype(mx.bfloat16)
+        normed = (y.astype(mx.float32) * next_norm.weight.astype(mx.float32)).astype(
+            mx.bfloat16
+        )
         return normed, out
 
 
@@ -199,21 +197,15 @@ def build_serial_tables(
                 f"{(end - start, H)}"
             )
         tg_parts.append(
-            mx.matmul(
-                (rows.astype(mx.float32) * nwf).astype(mx.bfloat16), wb
-            )
+            mx.matmul((rows.astype(mx.float32) * nwf).astype(mx.bfloat16), wb)
         )
         tsv_parts.append(
             mx.matmul(
-                (sqrt_c * codebook[start:end].astype(mx.float32)).astype(
-                    mx.bfloat16
-                ),
+                (sqrt_c * codebook[start:end].astype(mx.float32)).astype(mx.bfloat16),
                 pvb.T,
             )
         )
     tg = mx.concatenate(tg_parts, axis=0) if len(tg_parts) > 1 else tg_parts[0]
-    tsv = (
-        mx.concatenate(tsv_parts, axis=0) if len(tsv_parts) > 1 else tsv_parts[0]
-    )
+    tsv = mx.concatenate(tsv_parts, axis=0) if len(tsv_parts) > 1 else tsv_parts[0]
     mx.eval(tg, tsv)
     return tg, tsv

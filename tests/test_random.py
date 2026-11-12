@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from ref_utils import sampling_info
 
 from sglang_dspine.sampling.random import (
     ACCEPT,
@@ -20,6 +19,8 @@ from sglang_dspine.sampling.random import (
     seeded_uniforms,
     verification_uniforms,
 )
+
+from ref_utils import sampling_info
 
 
 @pytest.mark.parametrize("stream", [DRAFT, ACCEPT, BONUS, PREFILL])
@@ -232,7 +233,9 @@ def test_worker_scope_and_registered_prefill_hook_honor_api_seed():
         patch(
             "sglang.srt.runtime_context.get_exec",
             return_value=SimpleNamespace(
-                kernel=SimpleNamespace(sampling_backend="flashinfer")
+                # This integration test uses CPU tensors; FlashInfer filters
+                # require CUDA even when the host has a GPU available.
+                kernel=SimpleNamespace(sampling_backend="pytorch")
             ),
         ),
     ):

@@ -29,7 +29,7 @@ class RequestSampling:
         head_topk: int,
         vocab_size: int,
         deterministic_seeding: bool = False,
-    ) -> "RequestSampling":
+    ) -> RequestSampling:
         sp = req.sampling_params
         top_k = int(sp.top_k)
         temperature = float(sp.temperature)
@@ -37,9 +37,7 @@ class RequestSampling:
         greedy = top_k == 1 or temperature <= 1e-5
         unrestricted = top_k >= int(vocab_size)
         chain_top_k = (
-            int(head_topk)
-            if unrestricted
-            else min(max(top_k, 1), int(head_topk))
+            int(head_topk) if unrestricted else min(max(top_k, 1), int(head_topk))
         )
         target_top_k = int(vocab_size) if unrestricted else max(top_k, 1)
         seed = None

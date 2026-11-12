@@ -17,7 +17,6 @@ from ..bridge import build_serial_tables
 from ..model import DSpineDraftModel, load_draft, quantize_draft
 from ..propose import RefinementTail
 from ..target import HeadAccess, _find_lm_head
-
 from . import batched_tail
 from .batch import DraftBatchContext
 from .batched_attention import forward_block_batched
@@ -37,10 +36,10 @@ class DraftProposal:
 class BatchedProposal:
     """One decode round's proposals for every request in the batch."""
 
-    drafts: mx.array          # [B, T-1] int32
-    candidates: mx.array      # [B, T-1, K] int32
-    q_rows: mx.array | None   # [B, T-1, K] fp32 for sampled requests
-    greedy: mx.array          # [B] bool
+    drafts: mx.array  # [B, T-1] int32
+    candidates: mx.array  # [B, T-1, K] int32
+    q_rows: mx.array | None  # [B, T-1, K] fp32 for sampled requests
+    greedy: mx.array  # [B] bool
 
 
 class DraftRuntime:
@@ -72,7 +71,7 @@ class DraftRuntime:
         self.tail = RefinementTail(self.draft, self.head, self.tg, self.tsv)
 
     @classmethod
-    def load(cls, draft_path: str, target_model) -> "DraftRuntime":
+    def load(cls, draft_path: str, target_model) -> DraftRuntime:
         t0 = time.perf_counter()
         draft, cfg = load_draft(draft_path)
         bits = os.environ.get("DSPINE_MLX_DRAFT_BITS")
@@ -161,22 +160,16 @@ class DraftRuntime:
         """
         T = int(block_size)
         batch = len(anchors)
-        if not (
-            len(caches) == len(samplings) == len(rng_keys) == batch
-        ):
+        if not (len(caches) == len(samplings) == len(rng_keys) == batch):
             raise ValueError("propose_batch inputs are not aligned")
         phase = profiler.phase if profiler is not None else (lambda _n: nullcontext())
 
         with phase("draft.backbone"):
             if self._can_batch_backbone(caches, T):
-                block_ids = mx.full(
-                    (batch, T), self.mask_token_id, dtype=mx.int32
-                )
+                block_ids = mx.full((batch, T), self.mask_token_id, dtype=mx.int32)
                 block_ids[:, 0] = mx.array(anchors, dtype=mx.int32)
                 batch_ctx = DraftBatchContext.from_caches(caches, T)
-                out, stash = forward_block_batched(
-                    self.draft, block_ids, batch_ctx
-                )
+                out, stash = forward_block_batched(self.draft, block_ids, batch_ctx)
                 rows = out[:, 1:, :].reshape(batch * (T - 1), -1)
             else:
                 rows_list = []
@@ -188,8 +181,7 @@ class DraftRuntime:
                         parts[key].append(stash_i[key])
                 rows = mx.concatenate(rows_list, axis=0)
                 stash = {
-                    key: mx.concatenate(vals, axis=0)
-                    for key, vals in parts.items()
+                    key: mx.concatenate(vals, axis=0) for key, vals in parts.items()
                 }
 
         anchors_arr = mx.array([int(a) for a in anchors], dtype=mx.int32)

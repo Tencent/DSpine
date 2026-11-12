@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from .common import as_f32, as_i32, make_kernel
+from .common import make_kernel
 
 _SOURCE = r"""
 uint b = threadgroup_position_in_grid.x;

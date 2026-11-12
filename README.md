@@ -127,6 +127,11 @@ sglang serve \
   --trust-remote-code
 ```
 
+For larger batches, increase `--max-running-requests`,
+`--cuda-graph-max-bs-decode` and `--max-mamba-cache-size` together.
+TP1 only; batches above eight use full B16 verification without SPS.
+See [verification details](docs/large_batch_validation.md#cuda-graph-boundaries).
+
 ## Apple Silicon (MLX)
 
 Install with `pip install -e dspine_mlx`. See the [MLX guide](dspine_mlx/README.md)

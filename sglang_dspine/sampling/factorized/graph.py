@@ -1,9 +1,13 @@
-"""One immutable full-vocabulary weight cache and a q graph for each batch size."""
+"""Cached proposal graphs for small batches and bounded-workspace eager batches."""
+
+import logging
 
 import torch
 
 from sglang_dspine.sampling.factorized.kernels import Workspace, factor_table
 from sglang_dspine.sampling.factorized.weights import build_cache
+
+logger = logging.getLogger(__name__)
 
 
 def _signature(tensor):
@@ -27,10 +31,20 @@ class ProposalGraphs:
     def __init__(self, sampler):
         self.sampler = sampler
         self.entries = {}
-        self.inputs = {}
         self.workspaces = {}
         self.base = {}
         self.stream = None
+        self.eager_batches = set()
+        self.graph_max_bs = min(8, sampler.max_bs)
+        self.eager_output = (
+            torch.empty(
+                (sampler.max_bs * 15, 16, 16),
+                device=sampler.raw.device,
+                dtype=torch.float32,
+            )
+            if sampler.max_bs > self.graph_max_bs
+            else None
+        )
         bridge = sampler.draft_model.selected_prefix_bridge
         tensors = (
             bridge.codebook,
@@ -48,20 +62,17 @@ class ProposalGraphs:
             (key, _signature(value)) for key, value in sorted(self.weights.items())
         )
         current = torch.cuda.current_stream(sampler.raw.device)
-        for bs in range(1, 9):
+        for bs in range(1, self.graph_max_bs + 1):
             n = bs * 15
-            self.inputs[bs] = (
-                sampler.raw[: bs * 16],
-                sampler.rms[: bs * 16],
-                sampler.query[: bs * 16],
-                sampler.anchors[:bs],
-                sampler.candidate_out[:bs].view(n, 16),
-            )
             self.base[bs] = torch.empty(
                 (n, 16), device=sampler.raw.device, dtype=torch.float64
             )
             self.workspaces[bs] = Workspace.allocate(
-                n, 16, 5120, 512, sampler.raw.device
+                n,
+                16,
+                sampler.raw.shape[1],
+                sampler.query.shape[1],
+                sampler.raw.device,
             )
             output = torch.empty(
                 (n, 16, 16), device=sampler.raw.device, dtype=torch.float32
@@ -81,14 +92,15 @@ class ProposalGraphs:
             current.synchronize()
             self.entries[bs] = graph, output, pool
 
-    def _compute(self, bs, output):
-        raw, rms, query, anchors, candidates = self.inputs[bs]
+    def _compute(self, bs, output, start=0):
+        sampler = self.sampler
+        end = start + bs
         return factor_table(
-            raw,
-            rms,
-            query,
-            anchors,
-            candidates,
+            sampler.raw[start * 16 : end * 16],
+            sampler.rms[start * 16 : end * 16],
+            sampler.query[start * 16 : end * 16],
+            sampler.anchors[start:end],
+            sampler.candidate_out[start:end].view(bs * 15, 16),
             self.weights,
             self.sampler.norm_eps,
             16,
@@ -98,6 +110,10 @@ class ProposalGraphs:
         )
 
     def lookup(self, bs):
+        if not 1 <= bs <= self.sampler.max_bs:
+            raise ValueError(
+                f"Proposal batch {bs} exceeds capacity {self.sampler.max_bs}"
+            )
         if tuple(_signature(x) for x in self.source_tensors) != self.source_signature:
             raise RuntimeError("Proposal weights changed after graph capture")
         signature = tuple((k, _signature(v)) for k, v in sorted(self.weights.items()))
@@ -111,6 +127,20 @@ class ProposalGraphs:
             raise RuntimeError(
                 "Proposal graphs must stay on their original inference stream"
             )
-        graph, output, _ = self.entries[bs]
-        graph.replay()
+        if bs in self.entries:
+            graph, output, _ = self.entries[bs]
+            graph.replay()
+            return output
+        # Each request's table is independent. Reuse the existing small-batch
+        # workspaces on the inference stream rather than retaining a graph and
+        # a full FP64 cancellation workspace for every larger batch size.
+        output = self.eager_output[: bs * 15]
+        for start in range(0, bs, self.graph_max_bs):
+            count = min(self.graph_max_bs, bs - start)
+            self._compute(count, output[start * 15 : (start + count) * 15], start)
+        if bs not in self.eager_batches:
+            logger.info(
+                "DSpine eager proposal table: batch=%d chunk=%d", bs, self.graph_max_bs
+            )
+            self.eager_batches.add(bs)
         return output

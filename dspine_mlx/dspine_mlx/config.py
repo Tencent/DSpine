@@ -64,7 +64,9 @@ class DraftConfig:
         _require(self.vocab_size > 0, "vocab_size must be positive")
         _require(self.rms_norm_eps > 0, "rms_norm_eps must be positive")
         _require(self.rope_theta > 0, "rope_theta must be positive")
-        _require(self.max_position_embeddings > 0, "max_position_embeddings must be positive")
+        _require(
+            self.max_position_embeddings > 0, "max_position_embeddings must be positive"
+        )
         _require(self.block_size >= 2, "block_size must be >= 2")
         _require(
             0 <= self.mask_token_id < self.vocab_size,
@@ -96,7 +98,10 @@ class DraftConfig:
         )
         if self.architectures:
             _require(
-                any(a in ("DFlashDraftModel", "DSpineDraftModel") for a in self.architectures),
+                any(
+                    a in ("DFlashDraftModel", "DSpineDraftModel")
+                    for a in self.architectures
+                ),
                 f"unsupported draft architectures: {self.architectures}",
             )
         if self.raw.get("model_type") is not None:
@@ -105,7 +110,9 @@ class DraftConfig:
                 f"unsupported draft model_type {self.raw['model_type']!r}",
             )
         if self.raw.get("attention_bias") is not None:
-            _require(not self.raw["attention_bias"], "draft attention_bias must be false")
+            _require(
+                not self.raw["attention_bias"], "draft attention_bias must be false"
+            )
         if self.raw.get("hidden_act") is not None:
             _require(
                 self.raw["hidden_act"] == "silu",
@@ -130,13 +137,20 @@ class DraftConfig:
         )
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any], path: str | Path | None = None) -> "DraftConfig":
+    def from_dict(
+        cls, raw: dict[str, Any], path: str | Path | None = None
+    ) -> DraftConfig:
         where = f" ({path})" if path is not None else ""
         dflash = raw.get("dflash_config")
         _require(isinstance(dflash, dict), f"missing dflash_config{where}")
 
         # The DFlash2 / Domino / DSpark heads a DSpine draft does not have.
-        for key in ("selector_rank", "selector_top_k", "projector_type", "attention_sink_bias"):
+        for key in (
+            "selector_rank",
+            "selector_top_k",
+            "projector_type",
+            "attention_sink_bias",
+        ):
             _require(not dflash.get(key), f"unsupported DSpine draft key {key}{where}")
         _require(
             dflash.get("attention_value_scale") is None,
@@ -179,7 +193,9 @@ class DraftConfig:
         )
 
         bridge_raw = dflash.get("selected_prefix_code_bridge")
-        _require(isinstance(bridge_raw, dict), f"missing selected_prefix_code_bridge{where}")
+        _require(
+            isinstance(bridge_raw, dict), f"missing selected_prefix_code_bridge{where}"
+        )
         bridge = BridgeConfig(
             code_size=int(bridge_raw["code_size"]),
             rank=int(bridge_raw["rank"]),
@@ -189,7 +205,10 @@ class DraftConfig:
 
         num_layers = int(raw["num_hidden_layers"])
         feature_raw = dflash.get("selected_prefix_feature_layers")
-        _require(isinstance(feature_raw, list), f"missing selected_prefix_feature_layers{where}")
+        _require(
+            isinstance(feature_raw, list),
+            f"missing selected_prefix_feature_layers{where}",
+        )
         feature_layers = tuple(int(x) - 1 for x in feature_raw)
         _require(
             all(0 <= x < num_layers for x in feature_layers),
@@ -200,7 +219,10 @@ class DraftConfig:
         second = raw.get("code_bridge_second_pass")
         found: list[int] = []
         if refine is not None:
-            _require(isinstance(refine, dict), f"bad selected_prefix_last_write_refine{where}")
+            _require(
+                isinstance(refine, dict),
+                f"bad selected_prefix_last_write_refine{where}",
+            )
             _require(
                 set(refine) == {"kind", "version", "head_topk", "weight"},
                 f"selected_prefix_last_write_refine has unexpected keys{where}: {sorted(refine)}",

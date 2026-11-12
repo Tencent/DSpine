@@ -19,9 +19,9 @@ import mlx.core as mx
 @dataclass
 class DraftBatchContext:
     prefix_lens: list[int]
-    caches: list[list[Any]]          # [B][layer] mlx-lm KVCache
-    num_tokens: int                  # T
-    offsets: mx.array = field(init=False)   # [B] int32
+    caches: list[list[Any]]  # [B][layer] mlx-lm KVCache
+    num_tokens: int  # T
+    offsets: mx.array = field(init=False)  # [B] int32
     max_prefix: int = field(init=False)
     needs_padding: bool = field(init=False)
     mask: mx.array | None = field(init=False)  # [B,1,T,max_prefix+T] bool
@@ -32,9 +32,7 @@ class DraftBatchContext:
         self.offsets = mx.array(self.prefix_lens, dtype=mx.int32)
         self.max_prefix = max(self.prefix_lens)
         self.needs_padding = min(self.prefix_lens) < self.max_prefix
-        self.mask = _build_mask(
-            self.offsets, self.max_prefix, int(self.num_tokens)
-        )
+        self.mask = _build_mask(self.offsets, self.max_prefix, int(self.num_tokens))
 
     @classmethod
     def from_caches(cls, caches: list[list[Any]], block_size: int):
@@ -61,18 +59,12 @@ class DraftBatchContext:
         return [self.caches[b][layer_index] for b in range(len(self.caches))]
 
 
-def _build_mask(
-    offsets: mx.array, max_prefix: int, num_tokens: int
-) -> mx.array | None:
+def _build_mask(offsets: mx.array, max_prefix: int, num_tokens: int) -> mx.array | None:
     """Boolean keep-mask ``[B, 1, T, max_prefix+T]`` for one draft forward."""
     block = int(num_tokens)
     if max_prefix == 0:
-        causal = mx.arange(block)[None, :, None] >= mx.arange(block)[
-            None, None, :
-        ]
-        return mx.broadcast_to(
-            causal[None], (offsets.shape[0], 1, block, block)
-        )
+        causal = mx.arange(block)[None, :, None] >= mx.arange(block)[None, None, :]
+        return mx.broadcast_to(causal[None], (offsets.shape[0], 1, block, block))
     idx = mx.arange(max_prefix)[None, :]
     prefix_valid = idx < offsets[:, None]  # [B, max_prefix]
     prefix = mx.broadcast_to(
@@ -80,7 +72,5 @@ def _build_mask(
         (offsets.shape[0], 1, block, max_prefix),
     )
     causal = mx.arange(block)[None, :, None] >= mx.arange(block)[None, None, :]
-    block_mask = mx.broadcast_to(
-        causal[None], (offsets.shape[0], 1, block, block)
-    )
+    block_mask = mx.broadcast_to(causal[None], (offsets.shape[0], 1, block, block))
     return mx.concatenate([prefix, block_mask], axis=-1)

@@ -102,8 +102,10 @@ class _LayerHook:
 def _get_layers(model):
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
-    if hasattr(model, "language_model") and hasattr(model.language_model, "model") and hasattr(
-        model.language_model.model, "layers"
+    if (
+        hasattr(model, "language_model")
+        and hasattr(model.language_model, "model")
+        and hasattr(model.language_model.model, "layers")
     ):
         return model.language_model.model.layers
     if hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
@@ -165,7 +167,7 @@ class TargetAdapter:
         self._verify_steps = 0
 
     @classmethod
-    def load(cls, path: str | Path, target_layer_ids) -> "TargetAdapter":
+    def load(cls, path: str | Path, target_layer_ids) -> TargetAdapter:
         model, tokenizer = mlx_lm.load(str(path))
         return cls(model, tokenizer, target_layer_ids)
 

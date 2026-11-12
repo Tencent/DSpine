@@ -8,15 +8,6 @@ from unittest import mock
 
 import pytest
 import torch
-from ref_utils import (
-    assert_follows,
-    draft_candidates_overlapping,
-    ref_bridge_forward,
-    ref_refine_table,
-    ref_sample_chain,
-    ref_target_row,
-    sampling_info,
-)
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -28,6 +19,16 @@ from sglang_dspine.runtime.worker import (
     DSpineDraftSampler,
     build_dspine_target_probs,
     dspine_accept_sampling,
+)
+
+from ref_utils import (
+    assert_follows,
+    draft_candidates_overlapping,
+    ref_bridge_forward,
+    ref_refine_table,
+    ref_sample_chain,
+    ref_target_row,
+    sampling_info,
 )
 
 pytestmark = pytest.mark.skipif(
