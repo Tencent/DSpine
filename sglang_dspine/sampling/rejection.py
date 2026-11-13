@@ -162,6 +162,8 @@ def accept_sampled_prefix(
     prefix_lens,
     bs,
     verify_lens,
+    row_offsets=None,
+    row_to_request=None,
 ):
     """Verify one shortened target call, using this round's sampled chain q."""
     from sglang.srt.runtime_context import get_exec
@@ -177,6 +179,8 @@ def accept_sampled_prefix(
             prefix_lens=prefix_lens,
             bs=bs,
             verify_lens=verify_lens,
+            row_offsets=row_offsets,
+            row_to_request=row_to_request,
         )
         if result is not None:
             controller.sampled_executions += 1

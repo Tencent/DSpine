@@ -232,3 +232,30 @@ def test_sampled_verify_refuses_a_round_whose_sampled_chain_did_not_run():
             sampling_info=sampling_info(1, temperature=1.0),
             draft_input=None,
         )
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_sampling_memory_witness_stages_synthetic_q_and_restores_live_state(fail):
+    bs, width, k = 9, 16, 2
+    sampler = types.SimpleNamespace(k=k, _round_bs=3, _round_sampled=False,
+        candidate_out=torch.full((bs, width - 1, k), 7, dtype=torch.int64),
+        q_out=torch.full((bs, width - 1, k), .25))
+    saved_ids, saved_q = sampler.candidate_out.clone(), sampler.q_out.clone()
+    def verify(**kwargs):
+        assert sampler._round_bs == bs and sampler._round_sampled
+        assert torch.equal(sampler.candidate_out, kwargs["candidate_ids"])
+        assert torch.equal(sampler.q_out, kwargs["q_rows"])
+        assert torch.equal(sampler.q_out[..., 0], torch.ones(bs, width - 1))
+        if fail: raise RuntimeError("synthetic verifier failure")
+    worker = types.SimpleNamespace(
+        _dspine_sampler=sampler, _dspine_verify=verify, target_distribution=None
+    )
+    with mock.patch("torch.cuda.synchronize"), mock.patch("torch.cuda.reset_peak_memory_stats"), \
+         mock.patch("torch.cuda.memory_stats", return_value={"allocated_bytes.all.current":0, "allocated_bytes.all.peak":0}):
+        if fail:
+            with pytest.raises(RuntimeError, match="synthetic verifier failure"):
+                DSpineWorkerV2._measure_sampling_peak(worker, candidates=torch.zeros(bs, width), target_logits=torch.zeros(bs * width, 3), sampling_info=None)
+        else:
+            assert DSpineWorkerV2._measure_sampling_peak(worker, candidates=torch.zeros(bs, width), target_logits=torch.zeros(bs * width, 3), sampling_info=None)==0
+    assert sampler._round_bs == 3 and not sampler._round_sampled
+    assert torch.equal(sampler.candidate_out, saved_ids) and torch.equal(sampler.q_out, saved_q)

@@ -4,12 +4,29 @@ import copy
 import logging
 from collections import Counter
 from contextlib import contextmanager
+from numbers import Integral
 
 import torch
 import triton
 import triton.language as tl
 
 logger = logging.getLogger(__name__)
+
+
+def _has_duplicate_explicit_seeds(batch):
+    """Shared random streams cannot guide allocation across sampled requests."""
+    seen = set()
+    for req in getattr(batch, "reqs", ()) or ():
+        params = getattr(req, "sampling_params", None)
+        seed = getattr(params, "sampling_seed", None)
+        if not isinstance(seed, Integral):
+            continue
+        # RequestRNG mixes both halves of the seed's 64-bit representation.
+        effective = int(seed) & ((1 << 64) - 1)
+        if effective in seen:
+            return True
+        seen.add(effective)
+    return False
 
 
 @triton.jit
@@ -78,12 +95,13 @@ class VerifyCaps:
             )
         self.worker = worker
         self.full = int(worker.block_size)
-        self.policy = SpsPolicy.load(
+        self.default_policy, self.mode_policies = SpsPolicy.load_with_modes(
             get_spec().speculative_dspark_sps_table_path,
             hardware_identity(worker.device),
         )
-        self.widths = sorted({self.full, *self.policy.uniform_widths})
-        logger.info("DSPine SPS policy: %s", self.policy.to_dict())
+        self.policy = self.default_policy
+        self.widths = sorted({self.full, *(width for mode in ("greedy", "sampled") for width in self.policy_for_mode(mode).verify_widths.values())})
+        logger.info("DSPine SPS policy: %s; modes: %s", self.policy.to_dict(), {mode: policy.to_dict() for mode, policy in self.mode_policies.items()})
         self.runner = worker.target_worker.model_runner
         self.states = {
             self.full: (self.runner.attn_backend, self.runner.decode_cuda_graph_runner)
@@ -130,15 +148,24 @@ class VerifyCaps:
                 graph is not None,
             )
 
-    def begin(self, batch):
-        from sglang.srt.speculative.dflash_worker_v2 import _is_all_greedy
+    def policy_for_mode(self, mode):
+        # Old controller fixtures only supply self.policy; legacy files have no
+        # overrides. Retain their shared policy without inheriting a last mode.
+        return getattr(self, "mode_policies", {}).get(mode, getattr(self, "default_policy", self.policy))
 
-        greedy = batch is None or _is_all_greedy(batch.sampling_info)
+    def begin(self, batch):
+        greedy = (
+            batch is None
+            or batch.sampling_info is None
+            or batch.sampling_info.is_all_greedy
+        )
         self.sampled_round = not greedy
+        self.policy = self.policy_for_mode("greedy" if greedy else "sampled")
         sampled_eligible = (
             self.sampled_dynamic
             and batch is not None
             and (not getattr(batch.sampling_info, "is_any_greedy", True))
+            and (not _has_duplicate_explicit_seeds(batch))
         )
         enabled = (
             batch is not None
@@ -150,7 +177,7 @@ class VerifyCaps:
         self.in_round = bool(enabled)
         self.executed_width = None
         bs = batch.batch_size() if enabled else 0
-        self.active = self.policy.uniform_widths[bs - 1] if 1 <= bs <= 7 else self.full
+        self.active = self.policy.width(bs, self.full) if enabled else self.full
         if enabled:
             self.counts[batch.batch_size(), self.active] += 1
             count = sum(self.counts.values())
@@ -350,6 +377,13 @@ def around_target(original, target_worker, *args, **kwargs):
 
 def register_verify_cap_hooks():
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+    from sglang_dspine.sampling.compact import around_verify_logits_adjustments
+
+    HookRegistry.register(
+        "sglang.srt.speculative.dflash_worker_v2.apply_dflash_verify_logits_adjustments",
+        around_verify_logits_adjustments,
+        HookType.AROUND,
+    )
 
     HookRegistry.register(
         "sglang.srt.speculative.dflash_info.DFlashVerifyInput.prepare_for_verify",

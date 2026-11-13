@@ -1,4 +1,4 @@
-"""Prepare the fixed factorized q graphs after the native KV pools are allocated."""
+"""Prepare factorized proposal logits after native KV pools are allocated."""
 
 import torch
 
@@ -17,7 +17,9 @@ def prepare(sampler):
         sampler.query.zero_()
         sampler.anchors.zero_()
         sampler.candidate_out.copy_(
-            torch.arange(16, device=sampler.raw.device).expand_as(sampler.candidate_out)
+            torch.arange(sampler.k, device=sampler.raw.device).expand_as(
+                sampler.candidate_out
+            )
         )
         cache = ProposalGraphs(sampler)
     finally:

@@ -339,6 +339,9 @@ class DSpineDraftSampler:
             self.out,
             self.q_out.view(-1, k),
             t,
+            confidence_out=self.confidence_out[:bs].view(-1)
+            if self.confidence_enabled
+            else None,
         )
         self._round_sampled = True
 
@@ -375,7 +378,17 @@ def build_dspine_target_probs(
         temperatures=sampling_info.temperatures,
         rows_per_request=t,
     ).to(torch.float32)
-    return filter_target_probs(probs, sampling_info, t, bs, sampling_backend)
+    filtered = filter_target_probs(probs, sampling_info, t, bs, sampling_backend)
+    if getattr(sampling_info, "is_any_greedy", False):
+        # Native mixed-batch greedy rows use argmax, including its tie rule;
+        # top-k=1 filtering alone can keep several equal-probability tokens.
+        flat = filtered.reshape(bs * t, -1)
+        greedy = torch.repeat_interleave(sampling_info.top_ks.view(-1) <= 1, t)
+        tokens = next_token_logits.argmax(dim=-1, keepdim=True)
+        selected = flat.gather(-1, tokens).masked_fill(greedy[:, None], 1.0)
+        flat.masked_fill_(greedy[:, None], 0.0)
+        flat.scatter_(-1, tokens, selected)
+    return filtered
 
 
 def filter_target_probs(probs, sampling_info, t, bs, sampling_backend, normalize=True):
@@ -545,6 +558,9 @@ class DSpineWorkerV2(DFlashWorkerV2):
             max_bs=max_bs,
             device=self.device,
         )
+        self._dspine_sampler.capture_batch_sizes = tuple(
+            sorted({int(bs) for bs in graph_bs if 0 < int(bs) <= max_bs})
+        )
         self._dspine_dense_q: Optional[torch.Tensor] = None
         self._warned_min_p = False
         self._warned_dense_q_realloc = False
@@ -552,10 +568,6 @@ class DSpineWorkerV2(DFlashWorkerV2):
         dm.dspine_sampler = self._dspine_sampler
         self.target_distribution = None
         if self._dspine_sampler.optimized:
-            if max_bs > 8:
-                raise ValueError(
-                    "Qwen3.8-27B DSpine supports at most eight concurrent requests"
-                )
             from sglang_dspine.sampling.target import TargetDistribution
 
             self.target_distribution = TargetDistribution(self)
@@ -649,17 +661,51 @@ class DSpineWorkerV2(DFlashWorkerV2):
         )
         q_rows[..., 0] = 1.0
         proposals = torch.zeros_like(candidates)
-        dense_q = self._dense_q_buffer(bs, int(target_logits.shape[-1]))
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         base_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        self._dspine_verify(
-            candidates=proposals,
-            next_token_logits=target_logits,
-            candidate_ids=candidate_ids,
-            q_rows=q_rows,
-            sampling_info=sampling_info,
+        sampler = self._dspine_sampler
+        saved = (
+            sampler._round_bs,
+            sampler._round_sampled,
+            sampler.candidate_out[:bs].clone(),
+            sampler.q_out[:bs].clone(),
         )
+        try:
+            sampler._round_bs, sampler._round_sampled = bs, True
+            sampler.candidate_out[:bs].copy_(candidate_ids)
+            sampler.q_out[:bs].copy_(q_rows)
+            self._dspine_verify(
+                candidates=proposals,
+                next_token_logits=target_logits,
+                candidate_ids=candidate_ids,
+                q_rows=q_rows,
+                sampling_info=sampling_info,
+            )
+            if self.target_distribution is not None:
+                # Rehearse packed-row indexing with the real int64 q IDs too.
+                # This specialization otherwise first compiles under traffic.
+                devices = [candidates.device.index] if candidates.is_cuda else []
+                with torch.random.fork_rng(devices=devices):
+                    self.target_distribution.sample_prefix(
+                        candidates=proposals,
+                        next_token_logits=target_logits,
+                        sampling_info=sampling_info,
+                        prefix_lens=torch.zeros(
+                            bs, device=candidates.device, dtype=torch.int64
+                        ),
+                        bs=bs,
+                        verify_lens=torch.full(
+                            (bs,), block, device=candidates.device, dtype=torch.int32
+                        ),
+                        row_offsets=torch.arange(
+                            bs, device=candidates.device, dtype=torch.int32
+                        ) * block,
+                    )
+        finally:
+            sampler._round_bs, sampler._round_sampled = saved[:2]
+            sampler.candidate_out[:bs].copy_(saved[2])
+            sampler.q_out[:bs].copy_(saved[3])
         torch.cuda.synchronize()
         return torch.cuda.memory_stats()["allocated_bytes.all.peak"] - base_bytes
 
@@ -716,8 +762,6 @@ class DSpineWorkerV2(DFlashWorkerV2):
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
-        vocab = int(self._target_worker.model_runner.model_config.vocab_size)
-        self._dense_q_buffer(int(get_schedule().max_running_requests or 1), vocab)
         if self._dspine_sampler.optimized:
             from sglang_dspine.verification.sps import RaggedSpsCaps
 
@@ -802,8 +846,6 @@ class DSpineWorkerV2(DFlashWorkerV2):
 
     def _validate_phase1_sampling_support(self, batch) -> None:
         """Stage sampler state before each draft forward."""
-        if self.target_distribution is not None:
-            self.target_distribution.begin(batch)
         sampling_info = batch.sampling_info
         sampled = not _is_all_greedy(sampling_info)
         mode = batch.forward_mode
@@ -823,9 +865,7 @@ class DSpineWorkerV2(DFlashWorkerV2):
             self.dspine_round_counts["sampled"] += 1
 
     def _dense_q_buffer(self, bs: int, vocab: int) -> torch.Tensor:
-        """Persistent zeroed [cap, T-1, V] fp32 buffer for the dense q.  Sized once for the largest
-        decode batch (max_running_requests) in init_cuda_graphs, and grown by doubling only if a
-        batch ever exceeds it."""
+        """Allocate dense q only when the generic verifier needs it, and reuse capacity."""
         gamma = int(self.block_size) - 1
         buf = self._dspine_dense_q
         if buf is None or buf.shape[0] < bs or tuple(buf.shape[1:]) != (gamma, vocab):
@@ -894,6 +934,18 @@ class DSpineWorkerV2(DFlashWorkerV2):
         bs = candidates.shape[0]
         target_probs = None
         if self.target_distribution is not None:
+            outputs = self.target_distribution.sample_prefix(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                prefix_lens=torch.zeros(bs, device=candidates.device, dtype=torch.int32),
+                bs=bs,
+                verify_lens=torch.full(
+                    (bs,), self.block_size, device=candidates.device, dtype=torch.int32
+                ),
+            )
+            if outputs is not None:
+                return outputs[0], outputs[2]
             target_probs = self.target_distribution.dense(
                 next_token_logits, sampling_info, bs
             )

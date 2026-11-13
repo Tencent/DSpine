@@ -1,66 +1,64 @@
 # SPS tuning
 
-Tune verification budgets on your deployment GPU using representative conversation
-prefixes. The draft block size stays at 16. Tuning selects a uniform width for
-batch sizes 1–7 and a total budget for batch size 8, where
-[DSpark](https://arxiv.org/abs/2607.05147) allocates verification by draft confidence.
+Tune verification budgets for your hardware and workload using the same serving
+settings as deployment.
 
-## Prepare requests
+## 1. Prepare requests
 
-Save tokenized prefixes and sampling settings as JSONL:
+Save representative tokenized prefixes in `prefixes.jsonl`:
 
 ```json
-{"input_ids": [151644, 8948, 198], "sampling_params": {"temperature": 1.0, "top_k": 20, "top_p": 0.95}}
+{"task_id": "chat-001", "input_ids": [151644, 8948, 198], "sampling_params": {"temperature": 1.0, "top_k": 20, "top_p": 0.95}}
 ```
 
-Use at least eight distinct prefixes covering your context lengths, tasks and
-reasoning levels. Tune greedy (`temperature=0`) and temperature sampling separately.
+Use at least three independent tasks covering your context lengths and sampling
+settings. Keep the same `task_id` across a task's turns. To tune both greedy and
+temperature sampling, include requests for both modes (`temperature=0` for greedy).
+The tuner reserves one third of tasks for validation.
 
-## Tune
+## 2. Tune
 
-Run on one idle GPU. Pass your serving command after `--`; the tuner supplies the
-host, port and SPS profile options.
+Define your deployment command without host, port or SPS profile options; the
+tuner supplies those:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/tune_sps.py \
-  --requests /path/to/prefixes.jsonl --output /path/to/sps.json \
-  -- \
-  sglang serve \
-  --model-path /path/to/Qwen3.8-27B \
-  --speculative-algorithm DSPINE \
-  --speculative-draft-model-path /path/to/Qwen3.8-27B-DSpine-b16 \
-  --speculative-num-draft-tokens 16 \
-  --tp-size 1 --dtype bfloat16 \
-  --attention-backend fa3 --speculative-draft-attention-backend fa3 \
-  --linear-attn-backend triton --enable-linear-replayssm-spec \
-  --mamba-ssm-dtype float32 --mamba-radix-cache-strategy extra_buffer \
-  --max-mamba-cache-size 64 --mem-fraction-static 0.80 \
-  --context-length 131072 --max-running-requests 8 \
-  --cuda-graph-max-bs-decode 8 --min-free-slots-delay 1 \
-  --sampling-backend flashinfer --reasoning-parser qwen3 \
+serve=(
+  sglang serve
+  --model-path /path/to/Qwen3.8-27B
+  --speculative-algorithm DSPINE
+  --speculative-draft-model-path tencent/Qwen3.8-27B-DSpine-b16
+  --speculative-num-draft-tokens 16
+  --tp-size 1 --dtype bfloat16
+  --attention-backend fa3 --speculative-draft-attention-backend fa3
+  --linear-attn-backend triton --enable-linear-replayssm-spec
+  --mamba-ssm-dtype float32 --mamba-radix-cache-strategy extra_buffer
+  --max-mamba-cache-size 256 --mem-fraction-static 0.80
+  --context-length 131072 --max-running-requests 32
+  --cuda-graph-max-bs-decode 32 --min-free-slots-delay 1
+  --sampling-backend flashinfer --reasoning-parser qwen3
   --tool-call-parser qwen3_coder --trust-remote-code
+)
+
+CUDA_VISIBLE_DEVICES=0 python scripts/tune_sps.py \
+  --requests prefixes.jsonl --output sps.json \
+  --batch-sizes 1 8 16 32 \
+  -- "${serve[@]}"
 ```
 
-The default sweep tests widths 4, 8, 12 and 16 at batch sizes 1–8. Each candidate
-warms the prefixes, runs three timed repetitions, and is scored by median
-**total output tokens / total request wall time**. The selected combination is
-replayed once before saving.
+Set `--batch-sizes` to cover the batches you expect, including smaller batches
+as requests finish. Keep the serving capacity at least as large as the maximum.
+Defaults are three repetitions and an output limit of 4096 tokens; see `--help`
+for other options.
 
-- `sps.json`: selected policy and measurements.
-- `sps.runs/`: server logs and per-request outputs, timings, cache hits and acceptance counters.
+The tuner saves the policy to `sps.json` and measurements to `sps.runs/`.
+Failed validation retains the baseline policy.
 
-Throughput includes prefill and request overhead. Acceptance length is pooled
-accepted draft tokens / verify calls + 1. Use `--help` to adjust the sweep and
-response length (default: 512 tokens).
-
-## Serve
-
-Add the generated profile to your serving command:
+## 3. Serve
 
 ```bash
---speculative-dspark-sps-table-path /path/to/sps.json
+CUDA_VISIBLE_DEVICES=0 "${serve[@]}" \
+  --speculative-dspark-sps-table-path sps.json
 ```
 
-The file uses DSpine's policy format and records the GPU, launch command and input
-digest. Retune when changing the GPU, model, runtime or workload. Without a profile,
-verification uses the full 16-token block.
+Unmeasured batches retain the baseline, which defaults to full-block verification.
+Retune when changing hardware, models, serving settings or workload.

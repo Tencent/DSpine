@@ -1,0 +1,3 @@
+include scripts/tune_sps.py scripts/sps_search.py scripts/fit_calibration.py
+include docs/sps_tuning.md
+recursive-include tests *.py

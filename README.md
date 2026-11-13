@@ -98,7 +98,7 @@ sglang serve \
 The implementation uses [DSpark](https://github.com/deepseek-ai/DeepSpec)-based
 dynamic verification and [ReplaySSM](https://github.com/Johnny-Liou/ReplaySSM).
 
-Run [SPS tuning](docs/sps_tuning.md) to tune dynamic verification for your workload.
+Run [SPS tuning](docs/sps_tuning.md) with your serving settings to tune dynamic verification.
 Add `--speculative-dspark-sps-table-path sps.json` to the command below to load the result.
 
 ```bash
@@ -115,11 +115,11 @@ sglang serve \
   --enable-linear-replayssm-spec \
   --mamba-ssm-dtype float32 \
   --mamba-radix-cache-strategy extra_buffer \
-  --max-mamba-cache-size 64 \
+  --max-mamba-cache-size 256 \
   --mem-fraction-static 0.80 \
   --context-length 131072 \
-  --max-running-requests 8 \
-  --cuda-graph-max-bs-decode 8 \
+  --max-running-requests 32 \
+  --cuda-graph-max-bs-decode 32 \
   --min-free-slots-delay 1 \
   --sampling-backend flashinfer \
   --reasoning-parser qwen3 \

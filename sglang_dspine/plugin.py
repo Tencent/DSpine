@@ -86,12 +86,17 @@ def register():
     from sglang_dspine.layers.gdn import register_ragged_gdn_hooks
     from sglang_dspine.layers.layout import register_bf16_layout_hook
     from sglang_dspine.runtime.replayssm import hooks as replay
-    from sglang_dspine.sampling import target as target_probs
     from sglang_dspine.verification.caps import register_verify_cap_hooks
+    from sglang_dspine.verification.mrope import around_spec_mrope_positions
 
     if "DSpineDraftModel" not in ModelRegistry.models:
         ModelRegistry.register("sglang_dspine.models", strict=True)
     hooks = (
+        (
+            "sglang.srt.model_executor.forward_batch_info.ForwardBatch.compute_spec_mrope_positions",
+            around_spec_mrope_positions,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.layers.sampler.Sampler._sample_from_probs",
             around_seeded_sampler,
@@ -131,11 +136,6 @@ def register():
             "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.cleanup",
             head.around_cleanup,
             HookType.AROUND,
-        ),
-        (
-            "sglang.srt.managers.scheduler.Scheduler.__init__",
-            target_probs.after_scheduler_init,
-            HookType.AFTER,
         ),
     )
     for target, hook, kind in hooks:

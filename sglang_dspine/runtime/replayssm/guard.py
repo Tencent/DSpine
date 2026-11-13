@@ -18,7 +18,7 @@ def assert_active_empty(
     COUNT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.arange(0, BLOCK)
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     active = row < N
     request = tl.load(REQ + row, mask=active, other=-1).to(tl.int64)
     in_req = active & (request >= 0) & (request < REQ_SLOTS)
@@ -34,15 +34,17 @@ def assert_active_empty(
         tl.sum(bad.to(tl.int32), 0) == 0,
         "DSPine WP0 invariant: active request/state/ring index or cursor/flags invalid",
     )
-    if COUNT:
+    if COUNT and tl.program_id(0) == 0:
         tl.atomic_add(COUNTS + N, 1, sem="relaxed")
 
 
 def launch(torch, requests, mapping, wp, flags, counts, *, bs, state_slots, count=True):
-    assert 1 <= bs <= 8
+    assert bs >= 1
     assert requests.ndim == mapping.ndim == wp.ndim == flags.ndim == 1
     assert wp.shape == flags.shape and requests.shape[0] >= bs
-    assert_active_empty[1,](
+    if count:
+        assert counts.numel() > bs
+    assert_active_empty[triton.cdiv(bs, 128),](
         requests,
         mapping,
         wp,
@@ -53,7 +55,7 @@ def launch(torch, requests, mapping, wp, flags, counts, *, bs, state_slots, coun
         STATE_SLOTS=state_slots,
         RING_SLOTS=wp.shape[0],
         COUNT=count,
-        BLOCK=16,
+        BLOCK=128,
         num_warps=1,
         debug=True,
     )

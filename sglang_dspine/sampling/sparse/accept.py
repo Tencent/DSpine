@@ -112,13 +112,14 @@ def _tile_values(
     K: tl.constexpr,
     BLOCK: tl.constexpr,
     RAW: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
     lane = tl.arange(0, BLOCK)
     offset = start + lane
     tl.store(Scratch + b * BLOCK + lane, 0.0)
     tl.debug_barrier()
     qlane = tl.arange(0, K)
-    if dense:
+    if not PACKED or dense:
         if pure:
             result = tl.load(DenseP + row * V + offset, offset < V, 0.0)
             if RAW:
@@ -176,6 +177,34 @@ def _tile_values(
 
 
 @triton.jit
+def _packed_bonus(PIds, PVals, PLen, QIds, QVals, row, qi, pure, coin,
+                  V: tl.constexpr, CAP: tl.constexpr, K: tl.constexpr):
+    lane = tl.arange(0, CAP)
+    length = tl.load(PLen + row)
+    ids = tl.load(PIds + row * CAP + lane, lane < length, V)
+    values = tl.load(PVals + row * CAP + lane, lane < length, 0.0)
+    # Producers may emit probability order. CDF order is always vocabulary ID.
+    ordered = tl.sort(tl.where(lane < length, ids, V), descending=False)
+    p = tl.sum(tl.where(ordered[:, None] == ids[None, :], values[None, :], 0.0), 1)
+    p = tl.where(ordered < V, p, 0.0)
+    residual = p
+    if not pure:
+        qlane = tl.arange(0, K)
+        qids = tl.load(QIds + qi * K + qlane)
+        q = tl.load(QVals + qi * K + qlane)
+        q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
+        at_p = tl.sum(tl.where(ordered[:, None] == qids[None, :], q[None, :], 0.0), 1)
+        residual = tl.maximum(p - at_p, 0.0)
+        if tl.sum(residual, 0) <= 0.0:
+            residual = p
+    cdf = tl.cumsum(residual, 0)
+    # Derive mass from the same CDF; no rounding gap at the upper endpoint.
+    mass = tl.sum(tl.where(lane == CAP - 1, cdf, 0.0), 0)
+    hit = (cdf > coin * mass) & (ordered < V)
+    return tl.min(tl.where(hit, ordered, V - 1), 0)
+
+
+@triton.jit
 def _accept_sparse(
     Candidates,
     DenseP,
@@ -189,6 +218,7 @@ def _accept_sparse(
     U,
     UF,
     Prefix,
+    RowOffsets,
     Scratch,
     Denom,
     Accept,
@@ -202,8 +232,14 @@ def _accept_sparse(
     K: tl.constexpr,
     BLOCK: tl.constexpr,
     RAW: tl.constexpr,
+    PACKED: tl.constexpr,
+    HAS_ROW_OFFSETS: tl.constexpr,
+    HAS_DENSE: tl.constexpr,
 ):
     b = tl.program_id(0)
+    row_base = b * T
+    if HAS_ROW_OFFSETS:
+        row_base = tl.load(RowOffsets + b)
     cap = tl.load(Caps + b)
     accepted = 0
     step = 1
@@ -211,10 +247,15 @@ def _accept_sparse(
     pl = tl.arange(0, CAP)
     ql = tl.arange(0, K)
     while (step < cap) & (continuing == 1):
-        row = b * T + step - 1
+        row = row_base + step - 1
         qi = b * (T - 1) + step - 1
         token = tl.load(Candidates + b * T + step)
-        if tl.load(Overflow + row):
+        dense = True
+        if PACKED:
+            dense = tl.load(Overflow + row) != 0
+        if not HAS_DENSE:
+            tl.device_assert(dense == 0, "Packed target overflow requires dense fallback")
+        if not PACKED or dense:
             p = tl.load(DenseP + row * V + token)
             if RAW:
                 den = tl.load(Denom + row)
@@ -241,13 +282,41 @@ def _accept_sparse(
         else:
             continuing = 0
     all_accepted = accepted == cap - 1
-    row = b * T + accepted
+    row = row_base + accepted
     qi = b * (T - 1) + accepted
-    dense = tl.load(Overflow + row)
+    dense = True
+    if PACKED:
+        dense = tl.load(Overflow + row) != 0
+    if not HAS_DENSE:
+        tl.device_assert(dense == 0, "Packed target overflow requires dense fallback")
+    bonus = V - 1
+    if PACKED and dense == 0:
+        bonus = _packed_bonus(PIds, PVals, PLen, QIds, QVals, row, qi,
+                              all_accepted, tl.load(UF + b), V, CAP, K)
+    else:
+        bonus = _dense_bonus(DenseP, PIds, PVals, PLen, QIds, QVals, Scratch,
+                             Denom, row, qi, b, all_accepted, tl.load(UF + b),
+                             V, CAP, K, BLOCK, RAW, PACKED, dense)
+    tl.store(Accept + b, accepted)
+    tl.store(Commit + b, accepted + 1)
+    tl.store(Bonus + b, bonus)
+    i = tl.arange(0, T)
+    proposed = tl.load(Candidates + b * T + i + 1, i < T - 1, 0)
+    emitted = tl.where(i < accepted, proposed, tl.where(i == accepted, bonus, 0))
+    tl.store(Output + b * T + i, emitted)
+    tl.store(NewSeq + b, tl.load(Prefix + b) + accepted + 1)
+
+
+@triton.jit
+def _dense_bonus(DenseP, PIds, PVals, PLen, QIds, QVals, Scratch, Denom,
+                 row, qi, b, all_accepted, final_coin,
+                 V: tl.constexpr, CAP: tl.constexpr, K: tl.constexpr,
+                 BLOCK: tl.constexpr, RAW: tl.constexpr, PACKED: tl.constexpr,
+                 dense):
     mass = 0.0
     for start in range(0, V, BLOCK):
         empty = False
-        if dense == 0:
+        if PACKED and dense == 0:
             empty = _empty_p_tile(PIds, PLen, row, start, CAP, BLOCK)
         if not empty:
             value = _tile_values(
@@ -270,6 +339,7 @@ def _accept_sparse(
                 K,
                 BLOCK,
                 RAW,
+                PACKED,
             )
             mass += tl.sum(value, 0)
     pure = all_accepted | (mass <= 0.0)
@@ -277,7 +347,7 @@ def _accept_sparse(
         mass = 0.0
         for start in range(0, V, BLOCK):
             empty = False
-            if dense == 0:
+            if PACKED and dense == 0:
                 empty = _empty_p_tile(PIds, PLen, row, start, CAP, BLOCK)
             if not empty:
                 value = _tile_values(
@@ -300,16 +370,17 @@ def _accept_sparse(
                     K,
                     BLOCK,
                     RAW,
+                    PACKED,
                 )
                 mass += tl.sum(value, 0)
-    threshold = tl.load(UF + b) * mass
+    threshold = final_coin * mass
     before = 0.0
     bonus = V - 1
     found = 0
     for start in range(0, V, BLOCK):
         if found == 0:
             empty = False
-            if dense == 0:
+            if PACKED and dense == 0:
                 empty = _empty_p_tile(PIds, PLen, row, start, CAP, BLOCK)
             if empty:
                 if (before > threshold) & (start < V):
@@ -336,6 +407,7 @@ def _accept_sparse(
                     K,
                     BLOCK,
                     RAW,
+                    PACKED,
                 )
                 cdf = before + tl.cumsum(value, 0)
                 offset = start + tl.arange(0, BLOCK)
@@ -344,14 +416,7 @@ def _accept_sparse(
                     bonus = start + tl.argmax(hit.to(tl.int32), 0)
                     found = 1
                 before += tl.sum(value, 0)
-    tl.store(Accept + b, accepted)
-    tl.store(Commit + b, accepted + 1)
-    tl.store(Bonus + b, bonus)
-    i = tl.arange(0, T)
-    proposed = tl.load(Candidates + b * T + i + 1, i < T - 1, 0)
-    emitted = tl.where(i < accepted, proposed, tl.where(i == accepted, bonus, 0))
-    tl.store(Output + b * T + i, emitted)
-    tl.store(NewSeq + b, tl.load(Prefix + b) + accepted + 1)
+    return bonus
 
 
 def compress_probs(torch, p, capacity=64):
@@ -411,18 +476,42 @@ def accept_sparse(
     scratch=None,
     denominator=None,
     raw_fallback=False,
+    row_offsets=None,
+    vocab_size=None,
 ):
     (bs, t) = candidates.shape
-    vocab = dense_p.shape[-1]
-    (ids, vals, lens, overflow) = packed
+    if dense_p is None:
+        if packed is None or type(vocab_size) is not int or vocab_size < 1:
+            raise ValueError("Pure packed rejection requires packed probabilities and vocab_size")
+        if raw_fallback:
+            raise ValueError("Pure packed rejection requires normalized packed probabilities")
+        vocab = vocab_size
+    else:
+        vocab = dense_p.shape[-1]
+        if vocab_size is not None and vocab_size != vocab:
+            raise ValueError("vocab_size differs from the dense fallback")
+    if row_offsets is not None:
+        if (row_offsets.shape != (bs,) or row_offsets.device != candidates.device
+                or row_offsets.dtype not in (torch.int32, torch.int64)
+                or not row_offsets.is_contiguous()):
+            raise ValueError("row_offsets must be a contiguous device int32/int64 vector of batch size")
+    if packed is None:
+        # These pointers are not read by the dense-p specialization.
+        ids, vals, lens, overflow = q_ids, q_values, verify_lens, verify_lens
+        capacity = 1
+    else:
+        (ids, vals, lens, overflow) = packed
+        capacity = ids.shape[-1]
     if scratch is None:
-        scratch = torch.empty((bs, 4096), device=dense_p.device, dtype=torch.float32)
+        scratch = torch.empty((bs, 4096), device=candidates.device, dtype=torch.float32)
     if denominator is None:
-        denominator = torch.ones((bs * t,), device=dense_p.device, dtype=torch.float32)
+        if raw_fallback:
+            raise ValueError("Unnormalized target probabilities require a denominator")
+        denominator = dense_p if dense_p is not None else q_values
     assert t == 16 and q_ids.shape == q_values.shape == (bs, 15, 16)
     _accept_sparse[bs,](
         candidates,
-        dense_p,
+        dense_p if dense_p is not None else q_values,
         ids,
         vals,
         lens,
@@ -433,17 +522,22 @@ def accept_sparse(
         uniforms,
         uniform_final,
         prefix_lens,
+        row_offsets if row_offsets is not None else prefix_lens,
         scratch,
         denominator,
         *outputs,
         T=t,
         V=vocab,
-        CAP=ids.shape[-1],
+        CAP=capacity,
         K=16,
         BLOCK=4096,
         RAW=raw_fallback,
+        PACKED=packed is not None,
+        HAS_ROW_OFFSETS=row_offsets is not None,
+        HAS_DENSE=dense_p is not None,
         num_warps=4,
         enable_fp_fusion=True,
         enable_reflect_ftz=True,
+        debug=dense_p is None,
     )
     return outputs
