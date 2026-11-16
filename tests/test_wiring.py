@@ -17,6 +17,49 @@ from sglang_dspine.runtime.graph_runner import DSpineDraftCudaGraphRunner
 from sglang_dspine.runtime.worker import DSpineDraftSampler, DSpineWorkerV2
 
 
+def test_real_verify_caps_constructor_reads_resolved_tp_backend_metadata():
+    from sglang_dspine.verification import caps, policy
+
+    worker = types.SimpleNamespace(
+        block_size=16,
+        device="cpu",
+        _dspine_tp=types.SimpleNamespace(group=types.SimpleNamespace(world_size=2)),
+        draft_model_runner=types.SimpleNamespace(draft_attention_backend="triton"),
+    )
+    stop = RuntimeError("stop before GPU initialization")
+    with (
+        mock.patch(
+            "sglang.srt.runtime_context.get_exec",
+            return_value=types.SimpleNamespace(
+                kernel=types.SimpleNamespace(attention_backend="fa3")
+            ),
+        ),
+        mock.patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=types.SimpleNamespace(pp_size=1, attn_dp_enabled=False),
+        ),
+        mock.patch(
+            "sglang.srt.runtime_context.get_spec",
+            return_value=types.SimpleNamespace(
+                speculative_dspark_sps_table_path="profile.json"
+            ),
+        ),
+        mock.patch.object(policy, "hardware_identity", return_value={"gpu": "test"}),
+        mock.patch.object(
+            policy.SpsPolicy, "load_with_modes", side_effect=stop
+        ) as load,
+        pytest.raises(RuntimeError, match="stop before GPU initialization") as raised,
+    ):
+        caps.VerifyCaps(worker)
+    assert raised.value is stop
+    assert load.call_args.kwargs["execution"] == {
+        "tp_size": 2,
+        "draft_tp_size": 2,
+        "attention_backend": "fa3",
+        "draft_attention_backend": "triton",
+    }
+
+
 def _graph_runner(sampler):
     runner = object.__new__(DSpineDraftCudaGraphRunner)
     runner.model_runner = types.SimpleNamespace(

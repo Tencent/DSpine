@@ -58,9 +58,21 @@ def allocate_verify_lens(raw, probabilities, depth, budget, boundaries=None):
     return lens
 
 
-def device_plan(raw, probabilities, depth, budget, cfg, graph_tokens=None, boundaries=None):
+def device_plan(
+    raw,
+    probabilities,
+    depth,
+    budget,
+    cfg,
+    graph_tokens=None,
+    boundaries=None,
+    *,
+    tp=None,
+):
     if cfg.min_verify_len != 1 or cfg.survival_eps != 0.0:
-        raise ValueError("DSpine SPS requires one root per request and no survival cutoff")
+        raise ValueError(
+            "DSpine SPS requires one root per request and no survival cutoff"
+        )
     bs, gamma = raw.shape
     full = gamma + 1
     if graph_tokens is None:
@@ -70,11 +82,20 @@ def device_plan(raw, probabilities, depth, budget, cfg, graph_tokens=None, bound
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
     lens = allocate_verify_lens(raw, probabilities, depth, budget, boundaries)
+    if tp is not None:
+        tp.sync_tensor(lens)
     layout = RaggedVerifyLayout._assemble_device(
         verify_lens=lens, graph_num_tokens=graph_tokens, total_verify_tokens=budget
     )
-    index = torch.empty(budget, device=raw.device, dtype=torch.int64)
-    _indices[(bs,)](layout.qo_indptr_device, index, full, triton.next_power_of_2(full))
+    if raw.is_cuda:
+        index = torch.empty(budget, device=raw.device, dtype=torch.int64)
+        _indices[(bs,)](
+            layout.qo_indptr_device, index, full, triton.next_power_of_2(full)
+        )
+    else:
+        token = torch.arange(budget, device=raw.device)
+        row = torch.searchsorted(layout.qo_indptr_device[1:], token, right=True)
+        index = row * full + token - layout.qo_indptr_device[row]
     return layout, index
 
 
@@ -84,10 +105,10 @@ class RaggedSpsCaps(RaggedVerifyCaps):
         self.plans = {}
         if self.ragged_backend is None:
             return
+        from sglang.srt.runtime_context import get_spec
         from sglang.srt.speculative.dspark_components.dspark_planner import (
             DSparkScheduleConfig,
         )
-        from sglang.srt.runtime_context import get_spec
 
         path = get_spec().speculative_dspark_sps_table_path
         profile = json.loads(Path(path).read_text()) if path else {}
@@ -105,10 +126,13 @@ class RaggedSpsCaps(RaggedVerifyCaps):
         else:
             models = load_calibration_models(calibration, self.full - 1)
             self.probabilities = {
-                mode: model.probabilities.to(worker.device) for mode, model in models.items()
+                mode: model.probabilities.to(worker.device)
+                for mode, model in models.items()
             }
             self.boundaries = {
-                mode: model.boundaries.to(worker.device) if model.boundaries.numel() else None
+                mode: model.boundaries.to(worker.device)
+                if model.boundaries.numel()
+                else None
                 for mode, model in models.items()
             }
         self.depth = torch.arange(self.full - 1, device=worker.device)
@@ -132,19 +156,35 @@ class RaggedSpsCaps(RaggedVerifyCaps):
                     if tier is None:
                         continue
                     raw = worker._dspine_sampler.confidence_out[:bs]
-                    device_plan(raw, probabilities, self.depth, budget, self.cfg, tier, self.boundaries[family])
+                    device_plan(
+                        raw,
+                        probabilities,
+                        self.depth,
+                        budget,
+                        self.cfg,
+                        tier,
+                        self.boundaries[family],
+                    )
                     torch.cuda.synchronize(worker.device)
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
                         layout, index = device_plan(
-                            raw, probabilities, self.depth, budget, self.cfg, tier, self.boundaries[family]
+                            raw,
+                            probabilities,
+                            self.depth,
+                            budget,
+                            self.cfg,
+                            tier,
+                            self.boundaries[family],
                         )
                     self.plans[family, bs, budget, tier] = graph, layout, index
 
     def prepare(self, original, verify_input, batch, target_worker, *args, **kwargs):
         if self.in_round and self.ragged_round:
             family = "sampled" if self.sampled_round else "greedy"
-            plan = self.plans.get((family, self.batch_size, self.tokens, self.graph_tokens))
+            plan = self.plans.get(
+                (family, self.batch_size, self.tokens, self.graph_tokens)
+            )
             if plan is None:
                 self.layout, self.window_index = device_plan(
                     self.worker._dspine_sampler.confidence_out[: self.batch_size],
@@ -154,10 +194,14 @@ class RaggedSpsCaps(RaggedVerifyCaps):
                     self.cfg,
                     self.graph_tokens,
                     self.boundaries[family],
+                    tp=getattr(self, "tp", None),
                 )
             else:
                 graph, self.layout, self.window_index = plan
                 graph.replay()
+                tp = getattr(self, "tp", None)
+                if tp is not None:
+                    tp.sync_layout(self.layout, self.window_index)
             self.device_only_active = True
             self.lens_cpu = self.lens_tensor_cpu = None
         return super().prepare(

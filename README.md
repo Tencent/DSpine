@@ -127,6 +127,9 @@ sglang serve \
   --trust-remote-code
 ```
 
+Use `--tp-size N` for tensor parallelism and
+`--speculative-draft-attention-backend triton` for Triton draft attention.
+
 ## Apple Silicon (MLX)
 
 Install with `pip install -e dspine_mlx`. See the [MLX guide](dspine_mlx/README.md)

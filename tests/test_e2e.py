@@ -1,5 +1,5 @@
-"""End-to-end GPU tests for greedy, sampled, and mixed DSPINE requests.
-Requires the installed plugin and a target/draft model pair:
+"""TP1/TP2 end-to-end tests for greedy, sampled, and mixed DSPINE requests.
+Requires GPUs, the installed plugin, and a target/draft model pair:
     DSPINE_TARGET_MODEL=<target> DSPINE_DRAFT_MODEL=<draft> pytest tests/test_e2e.py
 Skipped when either model environment variable is unset.
 """
@@ -9,6 +9,7 @@ import unittest
 
 import pytest
 import requests
+from transformers import AutoConfig
 
 TARGET_MODEL = os.environ.get("DSPINE_TARGET_MODEL")
 DRAFT_MODEL = os.environ.get("DSPINE_DRAFT_MODEL")
@@ -40,23 +41,63 @@ SAMPLED = [
 
 
 class TestDSpineServer(CustomTestCase):
+    tp_size = 1
+
     @classmethod
     def setUpClass(cls):
         if not (TARGET_MODEL and DRAFT_MODEL):
             raise unittest.SkipTest("set DSPINE_TARGET_MODEL and DSPINE_DRAFT_MODEL")
         cls.base_url = DEFAULT_URL_FOR_TEST
+        model_config = AutoConfig.from_pretrained(TARGET_MODEL, trust_remote_code=True)
+        text_config = getattr(model_config, "text_config", model_config)
+        other_args = [
+            "--speculative-algorithm",
+            "DSPINE",
+            "--speculative-draft-model-path",
+            DRAFT_MODEL,
+            "--speculative-num-draft-tokens",
+            "16",
+            "--tp-size",
+            str(cls.tp_size),
+            "--dtype",
+            "bfloat16",
+            "--attention-backend",
+            "fa3",
+            "--speculative-draft-attention-backend",
+            "triton",
+            "--mem-fraction-static",
+            "0.7",
+            "--context-length",
+            "8192",
+            "--max-running-requests",
+            "8",
+            "--cuda-graph-max-bs-decode",
+            "8",
+            "--min-free-slots-delay",
+            "1",
+            "--sampling-backend",
+            "flashinfer",
+            "--trust-remote-code",
+        ]
+        if getattr(text_config, "linear_num_value_heads", None):
+            other_args.extend(
+                [
+                    "--linear-attn-backend",
+                    "triton",
+                    "--enable-linear-replayssm-spec",
+                    "--mamba-ssm-dtype",
+                    "float32",
+                    "--mamba-radix-cache-strategy",
+                    "extra_buffer",
+                    "--max-mamba-cache-size",
+                    "32",
+                ]
+            )
         cls.process = popen_launch_server(
             TARGET_MODEL,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "DSPINE",
-                "--speculative-draft-model-path",
-                DRAFT_MODEL,
-                "--mem-fraction-static",
-                "0.7",
-            ],
+            other_args=other_args,
         )
 
     @classmethod
@@ -108,6 +149,10 @@ class TestDSpineServer(CustomTestCase):
     def test_greedy_and_sampled_requests_share_a_batch(self):
         mixed = [GREEDY, SAMPLED[1], GREEDY, SAMPLED[0]]
         self._assert_speculates(self._generate(mixed))
+
+
+class TestDSpineTP2Server(TestDSpineServer):
+    tp_size = 2
 
 
 if __name__ == "__main__":

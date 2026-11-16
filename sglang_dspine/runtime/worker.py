@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.dflash_utils import (
@@ -19,16 +20,19 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     is_dflash_sampling_verify_available,
 )
-from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+from sglang.srt.speculative.dflash_worker_v2 import SIMULATE_ACC_LEN, DFlashWorkerV2
+from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 
 from sglang_dspine.kernels import dspine as dspine_kernels
 from sglang_dspine.models.dspine import DSpineDraftModel
+from sglang_dspine.runtime.tp_sync import DSpineTpCoordinator
 from sglang_dspine.sampling.random import (
     DRAFT,
     RequestRNG,
     seeded_batch,
     verification_uniforms,
 )
+from sglang_dspine.sampling.tp_head import TPHead
 
 logger = logging.getLogger(__name__)
 SAMPLED_VERIFY_TARGET = "sglang.srt.speculative.dflash_worker_v2.compute_dflash_sampling_correct_drafts_and_bonus"
@@ -75,7 +79,9 @@ class DSpineDraftSampler:
     [max_bs*(T-1)], candidate_out / q_out [max_bs, T-1, K].
     """
 
-    def __init__(self, *, draft_model, lm_head_weight, block_size, max_bs, device):
+    def __init__(
+        self, *, draft_model, lm_head_weight, block_size, max_bs, device, tp_head=None
+    ):
         torch.set_float32_matmul_precision("highest")
         torch.backends.cuda.matmul.allow_tf32 = False
         if torch.get_float32_matmul_precision() != "highest" or bool(
@@ -92,6 +98,7 @@ class DSpineDraftSampler:
         self.policy = "sampler"
         self.draft_model = draft_model
         self.lm_head_weight = lm_head_weight
+        self.tp_head = tp_head
         self.block_size = int(block_size)
         self.k = int(draft_model.head_topk)
         self.max_bs = int(max_bs)
@@ -103,13 +110,24 @@ class DSpineDraftSampler:
         r = int(bridge.rank)
         last = len(draft_model.layers) - 1
         f32 = torch.float32
+        head_rows = (
+            lm_head_weight if tp_head is None else lm_head_weight[: tp_head.num_local]
+        )
+        code_rows = (
+            bridge.codebook
+            if tp_head is None
+            else bridge.codebook[tp_head.start : tp_head.end]
+        )
         (self.tg, self.tsv) = dspine_kernels.build_serial_tables(
-            lm_head_weight,
+            head_rows,
             draft_model.norm.weight.detach(),
             bridge.feature_write_weights[last].detach(),
             bridge.packed_weight[r:].detach(),
-            bridge.codebook,
+            code_rows,
         )
+        if tp_head is not None:
+            self.tg = tp_head.gather_vocab_rows(self.tg)
+            self.tsv = tp_head.gather_vocab_rows(self.tsv)
         bridge.fold_terminal_sender_table(self.tsv)
         if bridge.terminal_residual_rank:
             self.res_emb = bridge.terminal_residual_embedding
@@ -148,8 +166,19 @@ class DSpineDraftSampler:
             (self.max_bs, gamma, k), dtype=torch.int64, device=device
         )
         self.q_out = torch.zeros((self.max_bs, gamma, k), dtype=f32, device=device)
+        self.candidate_head = (
+            torch.zeros((n, k, h), dtype=torch.bfloat16, device=device)
+            if tp_head is not None
+            else None
+        )
         self.optimized = (
-            tuple(lm_head_weight.shape) == (248320, 5120)
+            (
+                tp_head.global_vocab_size
+                if tp_head is not None
+                else lm_head_weight.shape[0]
+            )
+            == 248320
+            and h == 5120
             and t == 16
             and k == 16
             and r == 512
@@ -239,7 +268,7 @@ class DSpineDraftSampler:
             )
         bridge = dm.selected_prefix_bridge
         (t, k, r) = (self.block_size, self.k, int(bridge.rank))
-        (n, h) = rows.shape
+        (n, _hidden) = rows.shape
         if n % (t - 1) or input_ids.numel() != n // (t - 1) * t:
             raise RuntimeError("DSPINE tail expects whole request blocks")
         bs = n // (t - 1)
@@ -250,10 +279,34 @@ class DSpineDraftSampler:
             )
         if self.head is None:
             logits = torch.matmul(rows, self.lm_head_weight.T)
-            cand = dspine_kernels.topk_ids(logits, k)
+            if self.tp_head is None:
+                cand = dspine_kernels.topk_ids(logits, k)
+            else:
+                head = self.tp_head
+                logits[:, head.num_local :].fill_(float("-inf"))
+                width = min(k, logits.shape[1])
+                from flashinfer.topk import top_k
+
+                from sglang_dspine.layers.fp8.coarse import stable_local_topk
+
+                values, order = stable_local_topk(logits, width, top_k)
+                ids = order + head.start
+                values = values.masked_fill(ids >= head.end, float("-inf"))
+                ids = ids.masked_fill(ids >= head.end, head.global_vocab_size)
+                if width < k:
+                    values = torch.nn.functional.pad(
+                        values, (0, k - width), value=float("-inf")
+                    )
+                    ids = torch.nn.functional.pad(
+                        ids, (0, k - width), value=head.global_vocab_size
+                    )
+                _, cand = head.global_topk(values, ids, k)
+                cand = cand.sort(dim=-1).values.contiguous()
             del logits
         else:
             cand = self.head.retrieve(rows)
+        if self.tp_head is not None:
+            self.candidate_head[:n].copy_(self.tp_head.selected_rows(cand))
         idx = dspine_kernels.serial_table(
             stash["raw"],
             dm.norm.weight,
@@ -267,6 +320,9 @@ class DSpineDraftSampler:
             bridge.gate.bias,
             t,
             confidence=self.confidence_table[:n] if self.confidence_enabled else None,
+            candidate_head=self.candidate_head[:n]
+            if self.candidate_head is not None
+            else None,
         )
         dspine_kernels.serial_chain(
             idx,
@@ -321,9 +377,16 @@ class DSpineDraftSampler:
                 t,
                 res_emb=self.res_emb,
                 res_proj=self.res_proj_f32,
+                candidate_head=self.candidate_head[:n]
+                if self.candidate_head is not None
+                else None,
             )
         if self.random.seeds is None:
-            self.uniforms[:n].uniform_()
+            tp = self.random.tp
+            if tp is not None and tp.enabled:
+                self.uniforms[:n].copy_(tp.uniforms((n,), self.uniforms.device))
+            else:
+                self.uniforms[:n].uniform_()
         else:
             self.uniforms[:n].copy_(self.random.draw(t - 1, DRAFT).reshape(-1))
         dspine_kernels.serial_sample_chain(
@@ -344,6 +407,20 @@ class DSpineDraftSampler:
             else None,
         )
         self._round_sampled = True
+
+    def prepare_head(self):
+        """Allocate graph-owned retrieval scratch before capture."""
+        if self.optimized and self.head is None:
+            from sglang_dspine.layers.head import DraftHead
+
+            self.head = DraftHead(self)
+        return self.head
+
+    def prepare_graphs(self):
+        from sglang_dspine.sampling.proposal import prepare as prepare_proposal_graphs
+
+        if self.optimized:
+            self.proposal_cache = prepare_proposal_graphs(self)
 
     def after_graph_replay(self, forward_batch) -> None:
         """Run by DSpineDraftCudaGraphRunner after every draft graph replay, before the worker
@@ -512,8 +589,16 @@ class DSpineWorkerV2(DFlashWorkerV2):
             raise ValueError(
                 f"--speculative-algorithm DSPINE loaded draft class {type(dm).__name__}; expected DSpineDraftModel"
             )
-        if int(get_parallel().tp_group.world_size) != 1:
-            raise ValueError("DSPINE supports tp=1 only")
+        parallel = get_parallel()
+        self._dspine_tp = DSpineTpCoordinator(get_dp_tp_group())
+        if self._dspine_tp.enabled and (
+            parallel.attn_dp_enabled
+            or parallel.attn_cp_size > 1
+            or parallel.pp_group.world_size > 1
+        ):
+            raise ValueError(
+                "DSPINE tensor parallelism requires a single pipeline stage without attention DP/CP"
+            )
         if self.use_compact_draft_cache:
             raise ValueError("DSPINE does not support --speculative-draft-window-size")
         dm.set_block_size(int(self.block_size))
@@ -537,14 +622,34 @@ class DSpineWorkerV2(DFlashWorkerV2):
             )
         num_org = int(weight.shape[0])
         shard = getattr(lm_head, "shard_indices", None)
+        self._dspine_tp_head = None
         if shard is not None:
-            if int(shard.num_added_elements) or int(shard.org_vocab_start_index):
-                raise ValueError("DSPINE: added or offset target vocabulary")
+            if int(shard.num_added_elements):
+                raise ValueError("DSPINE: added target vocabulary")
             num_org = int(shard.num_org_elements)
         bridge = dm.selected_prefix_bridge
-        if num_org != int(bridge.codebook.shape[0]):
+        vocab_size = int(bridge.codebook.shape[0])
+        if self._dspine_tp.enabled:
+            if (
+                shard is None
+                or int(lm_head.tp_size) != self._dspine_tp.group.world_size
+                or lm_head.tp_group is not self._dspine_tp.group
+            ):
+                raise ValueError(
+                    "DSPINE target head and draft must use the same TP group"
+                )
+            self._dspine_tp_head = TPHead(
+                weight,
+                shard.org_vocab_start_index,
+                shard.org_vocab_end_index,
+                vocab_size,
+                lm_head.tp_group,
+            )
+        elif num_org != vocab_size or (
+            shard is not None and int(shard.org_vocab_start_index)
+        ):
             raise ValueError(
-                f"DSPINE: target vocabulary {num_org} != code-bridge codebook {int(bridge.codebook.shape[0])}"
+                f"DSPINE: target vocabulary {num_org} != code-bridge codebook {vocab_size}"
             )
         if int(weight.shape[1]) != int(dm.config.hidden_size):
             raise ValueError("DSPINE: target lm_head width != draft hidden size")
@@ -553,11 +658,15 @@ class DSpineWorkerV2(DFlashWorkerV2):
         self.sampled_policy = "sampler"
         self._dspine_sampler = DSpineDraftSampler(
             draft_model=dm,
-            lm_head_weight=weight[:num_org],
+            lm_head_weight=weight
+            if self._dspine_tp_head is not None
+            else weight[:num_org],
             block_size=self.block_size,
             max_bs=max_bs,
             device=self.device,
+            tp_head=self._dspine_tp_head,
         )
+        self._dspine_sampler.random.tp = self._dspine_tp
         self._dspine_sampler.capture_batch_sizes = tuple(
             sorted({int(bs) for bs in graph_bs if 0 < int(bs) <= max_bs})
         )
@@ -574,7 +683,7 @@ class DSpineWorkerV2(DFlashWorkerV2):
         self._check_seams(server_args)
         global _active_worker
         if _active_worker is not None and _active_worker is not self:
-            raise RuntimeError("DSPINE runs one draft worker per process (tp=1)")
+            raise RuntimeError("DSPINE runs one draft worker per process")
         _active_worker = self
         if self._target_tp_rank == 0:
             conv = dm.layers[0].attention_conv
@@ -622,7 +731,7 @@ class DSpineWorkerV2(DFlashWorkerV2):
             and batch.forward_mode.is_decode()
         ):
             raise RuntimeError("Requested DSPine verify caps were not initialized")
-        with seeded_batch(batch):
+        with seeded_batch(batch, getattr(self, "_dspine_tp", None)):
             if controller is None:
                 return super().forward_batch_generation(*args, **kwargs)
             controller.begin(batch)
@@ -633,6 +742,7 @@ class DSpineWorkerV2(DFlashWorkerV2):
 
     def _accept_block(self, **kwargs):
         controller = getattr(self, "verify_caps", None)
+        native_site = None
         if (
             controller is not None
             and controller.in_round
@@ -641,6 +751,25 @@ class DSpineWorkerV2(DFlashWorkerV2):
             result = controller.accept(**kwargs)
         else:
             result = super()._accept_block(**kwargs)
+            if self._selector_sample is not None:
+                native_site = SpecTpSyncSite.DFLASH_SELECTOR
+            elif (
+                not _is_all_greedy(kwargs["sampling_info"])
+                and is_dflash_sampling_verify_available()
+            ):
+                native_site = SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE
+            else:
+                native_site = SpecTpSyncSite.DFLASH_ACCEPT_GREEDY
+        tp = getattr(self, "_dspine_tp", None)
+        if tp is not None and tp.enabled and (
+            native_site is None
+            or not self._tp_sync.enabled(native_site)
+            or SIMULATE_ACC_LEN > 0
+        ):
+            # Native DFlash already synchronizes before committing. Caps/ragged
+            # bypass it; env-disabled sites and post-sync simulation also need
+            # mandatory agreement. Share their existing buffers without recommit.
+            tp.sync_accept(*result)
         if controller is not None and hasattr(controller, "observe"):
             controller.observe(result[0])
         return result
@@ -700,7 +829,8 @@ class DSpineWorkerV2(DFlashWorkerV2):
                         ),
                         row_offsets=torch.arange(
                             bs, device=candidates.device, dtype=torch.int32
-                        ) * block,
+                        )
+                        * block,
                     )
         finally:
             sampler._round_bs, sampler._round_sampled = saved[:2]
@@ -735,18 +865,9 @@ class DSpineWorkerV2(DFlashWorkerV2):
     def init_attention_backends(self):
         super().init_attention_backends()
         if self.draft_model.native_swa_window is not None:
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
+            from sglang_dspine.layers.attention import validate_native_swa_backend
 
-            runner = self.draft_model_runner
-            backend = runner.attn_backend
-            if type(backend) is not FlashAttentionBackend or backend.fa_impl_ver != int(
-                runner.draft_attention_backend[-1]
-            ):
-                raise ValueError(
-                    "Native DSPINE SWA candidate requires the resolved FA3/FA4 backend itself"
-                )
+            validate_native_swa_backend(self.draft_model_runner)
 
     def alloc_memory_pool(self, *args, **kwargs):
         result = super().alloc_memory_pool(*args, **kwargs)
@@ -761,6 +882,7 @@ class DSpineWorkerV2(DFlashWorkerV2):
         return result
 
     def init_cuda_graphs(self):
+        self._dspine_sampler.prepare_head()
         super().init_cuda_graphs()
         if self._dspine_sampler.optimized:
             from sglang_dspine.verification.sps import RaggedSpsCaps
@@ -792,6 +914,7 @@ class DSpineWorkerV2(DFlashWorkerV2):
         sampler.propose(hidden_states, self._draft_block_ids_buf[:bs].reshape(-1))
         if sampler.round_samples:
             sampler.sample(bs)
+        self._dspine_tp.sync_proposal(sampler, bs)
         if self.dspine_round_counts["eager"] == 0 and self._target_tp_rank == 0:
             logger.info("DSPINE: first eager draft round (bs=%d)", bs)
         self.dspine_round_counts["eager"] += 1
@@ -813,10 +936,10 @@ class DSpineWorkerV2(DFlashWorkerV2):
         # The parent stages only when the draft graph was captured; stage in every case.
         sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
         sampler(hidden, block_ids.view(-1))
-        if _is_all_greedy(sampling_info):
-            return sampler.out[: bs * gamma].view(bs, gamma)
-        sampler.sample(bs)
-        self._selector_sample = (sampler.candidate_out[:bs], sampler.q_out[:bs])
+        if not _is_all_greedy(sampling_info):
+            sampler.sample(bs)
+            self._selector_sample = (sampler.candidate_out[:bs], sampler.q_out[:bs])
+        self._dspine_tp.sync_proposal(sampler, bs)
         return sampler.out[: bs * gamma].view(bs, gamma)
 
     def _selector_sampling_accept(
@@ -938,7 +1061,9 @@ class DSpineWorkerV2(DFlashWorkerV2):
                 candidates=candidates,
                 next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
-                prefix_lens=torch.zeros(bs, device=candidates.device, dtype=torch.int32),
+                prefix_lens=torch.zeros(
+                    bs, device=candidates.device, dtype=torch.int32
+                ),
                 bs=bs,
                 verify_lens=torch.full(
                     (bs,), self.block_size, device=candidates.device, dtype=torch.int32

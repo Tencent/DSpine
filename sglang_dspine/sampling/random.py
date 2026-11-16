@@ -1,3 +1,7 @@
+# Copyright 2026 Tencent
+# Licensed under the Apache License, Version 2.0.
+# Adapted from Tencent/DSpine (Apache-2.0).
+
 """Request-seeded random draws keyed by absolute block position and draw purpose."""
 
 import secrets
@@ -12,6 +16,7 @@ from sglang.kernels.ops.sampling.murmur_hash import (
 )
 
 DRAFT, ACCEPT, BONUS, PREFILL = range(4)
+_UNSET = object()
 
 
 def _cpu_uniforms(seeds, positions, width, stream):
@@ -87,8 +92,9 @@ def seeded_uniforms(seeds, positions, width, stream):
 
 
 class RequestRNG:
-    def __init__(self):
+    def __init__(self, tp=None):
         self.seeds = self.positions = None
+        self.tp = tp
 
     def stage(self, seeds, positions):
         self.seeds = seeds
@@ -100,6 +106,9 @@ class RequestRNG:
 
 def verification_uniforms(bs, width, device, random_state=None):
     if random_state is None or random_state.seeds is None:
+        tp = getattr(random_state, "tp", None)
+        if tp is not None and tp.enabled:
+            return tp.uniforms((bs, width - 1), device), tp.uniforms((bs,), device)
         return (
             torch.rand((bs, width - 1), device=device, dtype=torch.float32),
             torch.rand((bs,), device=device, dtype=torch.float32),
@@ -110,7 +119,7 @@ def verification_uniforms(bs, width, device, random_state=None):
 
 
 @contextmanager
-def seeded_batch(batch):
+def seeded_batch(batch, tp=None):
     """Scope request seeds to the worker call, leaving scheduler merge state intact."""
     info = getattr(batch, "sampling_info", None)
     if info is None:
@@ -118,26 +127,48 @@ def seeded_batch(batch):
         return
     original = getattr(info, "sampling_seed", None)
     reqs = getattr(batch, "reqs", ())
-    if original is None and any(
-        r.sampling_params.sampling_seed is not None for r in reqs
+    distributed = tp is not None and tp.enabled
+    if (
+        original is None
+        and reqs
+        and (
+            distributed
+            or any(r.sampling_params.sampling_seed is not None for r in reqs)
+        )
     ):
-        seeds = []
-        for req in reqs:
-            seed = req.sampling_params.sampling_seed
-            if seed is None:
-                seed = getattr(req, "_dspine_random_seed", None)
+        if distributed:
+            seeds = tp.request_seeds(reqs)
+        else:
+            seeds = []
+            for req in reqs:
+                seed = req.sampling_params.sampling_seed
                 if seed is None:
-                    seed = secrets.randbits(63)
-                    req._dspine_random_seed = seed
-            seeds.append(seed)
+                    seed = getattr(req, "_dspine_random_seed", None)
+                    if seed is None:
+                        seed = secrets.randbits(63)
+                        req._dspine_random_seed = seed
+                seeds.append(seed)
         host_seeds = torch.tensor(
             seeds, dtype=torch.int64, pin_memory=info.temperatures.is_cuda
         )
         info.sampling_seed = host_seeds.to(info.temperatures.device, non_blocking=True)
+    previous_tp = getattr(info, "_dspine_tp", _UNSET)
+    if distributed:
+        info._dspine_tp = tp
     try:
         yield
     finally:
         info.sampling_seed = original
+        if distributed:
+            if previous_tp is _UNSET:
+                del info._dspine_tp
+            else:
+                info._dspine_tp = previous_tp
+
+
+def sync_prefill_tokens(tokens, info):
+    tp = getattr(info, "_dspine_tp", None)
+    return tokens if tp is None else tp.sync_tensor(tokens)
 
 
 def sample_prefill(probs, info, positions):
@@ -150,11 +181,20 @@ def sample_prefill(probs, info, positions):
     weights = filter_target_probs(
         probs, info, 1, bs, get_exec().kernel.sampling_backend, normalize=False
     ).view(bs, vocab)
+    if getattr(info, "is_any_greedy", True):
+        # Top-k one may retain ties. Greedy rows instead use the sampler's
+        # lowest-index argmax, including the captured post-filter weights.
+        greedy = info.top_ks.view(bs) <= 1
+        tokens = probs.argmax(-1, keepdim=True)
+        selected = weights.gather(1, tokens).masked_fill(greedy[:, None], 1.0)
+        weights = weights.masked_fill(greedy[:, None], 0.0)
+        weights.scatter_(1, tokens, selected)
     cdf = weights.cumsum(-1, dtype=torch.float64)
     coin = seeded_uniforms(info.sampling_seed, positions.reshape(bs), 1, PREFILL)
     tokens = (
         (cdf > coin.double() * cdf[:, -1:]).to(torch.int32).argmax(-1).to(torch.int32)
     )
+    tokens = sync_prefill_tokens(tokens, info)
     capture = None
     indices = getattr(info, "sampling_mask_batch_indices", None)
     if indices is not None:

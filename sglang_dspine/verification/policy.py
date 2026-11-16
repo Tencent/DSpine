@@ -41,11 +41,11 @@ class SpsPolicy:
         }
 
     @classmethod
-    def load(cls, path, hardware):
-        return cls.load_with_modes(path, hardware)[0]
+    def load(cls, path, hardware, execution=None):
+        return cls.load_with_modes(path, hardware, execution)[0]
 
     @classmethod
-    def load_with_modes(cls, path, hardware):
+    def load_with_modes(cls, path, hardware, execution=None):
         """Load a fallback and optional mode overrides from the same profile."""
         if not path:
             return cls(), {}
@@ -56,6 +56,30 @@ class SpsPolicy:
             raise ValueError(
                 "SPS profile hardware differs; rerun scripts/tune_sps.py on this GPU"
             )
+        if execution is not None:
+            recorded = data.get("execution")
+            if recorded is None:
+                if execution["tp_size"] != 1 or execution["draft_tp_size"] != 1:
+                    raise ValueError(
+                        "SPS profile has no TP layout; retune for this deployment"
+                    )
+            else:
+                for name in (
+                    "tp_size",
+                    "draft_tp_size",
+                    "attention_backend",
+                    "draft_attention_backend",
+                ):
+                    expected, actual = execution.get(name), recorded.get(name)
+                    if (
+                        name.endswith("tp_size")
+                        or expected is not None
+                        and actual is not None
+                    ):
+                        if expected != actual:
+                            raise ValueError(
+                                "SPS profile execution layout differs; retune for this deployment"
+                            )
         policy = data["policy"]
         if data["format"] == "dspine-sps-v1":
             widths, budget = policy["uniform_widths"], policy["batch8_tokens"]
@@ -70,7 +94,9 @@ class SpsPolicy:
         modes = data.get("mode_policies", {})
         if not isinstance(modes, dict) or set(modes) - {"greedy", "sampled"}:
             raise ValueError("SPS mode_policies only supports greedy and sampled")
-        return cls.from_dict(policy), {mode: cls.from_dict(value) for mode, value in modes.items()}
+        return cls.from_dict(policy), {
+            mode: cls.from_dict(value) for mode, value in modes.items()
+        }
 
     @classmethod
     def from_dict(cls, policy):
@@ -91,4 +117,15 @@ def hardware_identity(device):
         "name": props.name,
         "capability": [props.major, props.minor],
         "memory_bytes": props.total_memory,
+    }
+
+
+def execution_identity(
+    tp_size, draft_tp_size, attention_backend=None, draft_attention_backend=None
+):
+    return {
+        "tp_size": int(tp_size),
+        "draft_tp_size": int(draft_tp_size),
+        "attention_backend": attention_backend,
+        "draft_attention_backend": draft_attention_backend,
     }

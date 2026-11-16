@@ -12,7 +12,9 @@ from sglang_dspine.layers.fp8.workspace import PrivateFIWorkspace
 class DraftHead:
     def __init__(self, sampler):
         self.sampler = sampler
-        self.coarse = FullVFP8Coarse(torch, sampler.lm_head_weight)
+        self.coarse = FullVFP8Coarse(
+            torch, sampler.lm_head_weight, getattr(sampler, "tp_head", None)
+        )
         self.actual_bs = torch.full(
             (1,), sampler.max_bs, device=sampler.raw.device, dtype=torch.int32
         )

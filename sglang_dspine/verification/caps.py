@@ -90,18 +90,43 @@ class VerifyCaps:
         from sglang_dspine.verification.policy import SpsPolicy, hardware_identity
 
         if get_parallel().attn_dp_enabled or int(get_parallel().pp_size) != 1:
-            raise ValueError(
-                "DSPine prefix verification currently supports TP1/DP1/PP1"
-            )
+            raise ValueError("DSPine prefix verification currently requires DP1/PP1")
         self.worker = worker
+        self.tp = getattr(worker, "_dspine_tp", None)
         self.full = int(worker.block_size)
+        profile_kwargs = {}
+        if self.tp is not None:
+
+            from sglang_dspine.verification.policy import execution_identity
+
+            size = int(self.tp.group.world_size)
+            profile_kwargs["execution"] = execution_identity(
+                size,
+                size,
+                get_exec().kernel.attention_backend,
+                worker.draft_model_runner.draft_attention_backend,
+            )
         self.default_policy, self.mode_policies = SpsPolicy.load_with_modes(
             get_spec().speculative_dspark_sps_table_path,
             hardware_identity(worker.device),
+            **profile_kwargs,
         )
         self.policy = self.default_policy
-        self.widths = sorted({self.full, *(width for mode in ("greedy", "sampled") for width in self.policy_for_mode(mode).verify_widths.values())})
-        logger.info("DSPine SPS policy: %s; modes: %s", self.policy.to_dict(), {mode: policy.to_dict() for mode, policy in self.mode_policies.items()})
+        self.widths = sorted(
+            {
+                self.full,
+                *(
+                    width
+                    for mode in ("greedy", "sampled")
+                    for width in self.policy_for_mode(mode).verify_widths.values()
+                ),
+            }
+        )
+        logger.info(
+            "DSPine SPS policy: %s; modes: %s",
+            self.policy.to_dict(),
+            {mode: policy.to_dict() for mode, policy in self.mode_policies.items()},
+        )
         self.runner = worker.target_worker.model_runner
         self.states = {
             self.full: (self.runner.attn_backend, self.runner.decode_cuda_graph_runner)

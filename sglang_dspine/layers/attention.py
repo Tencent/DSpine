@@ -3,7 +3,7 @@
 WINDOW = 8192
 BLOCK_SIZE = 16
 NUM_LAYERS = 5
-BACKENDS = frozenset(("fa3",))
+BACKENDS = frozenset(("fa3", "triton"))
 
 
 def _get(config, name, default=None):
@@ -79,7 +79,7 @@ def validate_native_swa_runner(runner, *, served_block_size):
         raise ValueError("Qwen3.8-27B DSpine serves its trained block size16")
     if runner.draft_attention_backend not in BACKENDS:
         raise ValueError(
-            "Native DSPINE SWA configuration requires explicit --speculative-draft-attention-backend fa3"
+            "Native DSPINE SWA configuration requires --speculative-draft-attention-backend fa3 or triton"
         )
     if runner.sliding_window_size != WINDOW - 1:
         raise ValueError("Native DSPINE runner must preserve window_left=8191")
@@ -87,3 +87,24 @@ def validate_native_swa_runner(runner, *, served_block_size):
         raise ValueError(
             "Native DSPINE SWA configuration requires the dense draft KV path"
         )
+
+
+def validate_native_swa_backend(runner):
+    """Check the resolved draft backend before graph capture."""
+    name = runner.draft_attention_backend
+    backend = runner.attn_backend
+    if name == "fa3":
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        if type(backend) is FlashAttentionBackend and backend.fa_impl_ver == 3:
+            return
+    elif name == "triton":
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        if type(backend) is TritonAttnBackend:
+            return
+    raise ValueError(
+        f"DSPINE draft backend {name!r} resolved to incompatible {type(backend).__name__}"
+    )

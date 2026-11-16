@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 # Also works directly from a source checkout, before an editable installation.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sglang_dspine.verification.calibration import load_calibration_tables
-from sglang_dspine.verification.policy import SpsPolicy, hardware_identity
+from sglang_dspine.verification.policy import SpsPolicy, execution_identity, hardware_identity
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sps_search import (
     aggregate, current_budget, paired_decision, prefer_budget, replace_budget,
@@ -33,13 +33,14 @@ from sps_search import (
 
 def option_value(command, name):
     """Read the native CLI's separated/equal forms, with last-value precedence."""
+    names = (name,) if isinstance(name, str) else name
     result = None
     for index, argument in enumerate(command):
-        if argument == name:
+        if argument in names:
             if index + 1 == len(command) or command[index + 1].startswith("--"):
-                raise ValueError(f"Missing value for {name}")
+                raise ValueError(f"Missing value for {argument}")
             result = command[index + 1]
-        elif argument.startswith(name + "="):
+        elif "=" in argument and argument.split("=", 1)[0] in names:
             result = argument.split("=", 1)[1]
     return result
 
@@ -595,9 +596,14 @@ def main():
     except ValueError as error:
         parser.error(str(error))
     hardware = hardware_identity(0)
-    base = {"format":"dspine-sps-v2", "hardware":hardware, "policy":SpsPolicy().to_dict(), "mode_policies":{}}
+    tp_value = option_value(command, ("--tp-size", "--tp", "--tensor-parallel-size"))
+    tp_size = 1 if tp_value is None else int(tp_value)
+    execution = execution_identity(tp_size, tp_size, option_value(command, "--attention-backend"),
+                                   option_value(command, "--speculative-draft-attention-backend"))
+    base = {"format":"dspine-sps-v2", "hardware":hardware, "execution":execution,
+            "policy":SpsPolicy().to_dict(), "mode_policies":{}}
     if args.baseline_profile:
-        default, modes = SpsPolicy.load_with_modes(args.baseline_profile, hardware)
+        default, modes = SpsPolicy.load_with_modes(args.baseline_profile, hardware, execution)
         old = json.loads(args.baseline_profile.read_text())
         base.update(policy=default.to_dict(),mode_policies={mode:p.to_dict() for mode,p in modes.items()})
         if "confidence_calibration" in old:
@@ -618,6 +624,10 @@ def main():
     save_json(probe, base)
     with server(command, probe, folder / "probe", args.port, args.startup_timeout) as url:
         info = request(url + "/server_info", timeout=60)
+        base["execution"] = execution_identity(
+            info.get("tp_size", tp_size), info.get("tp_size", tp_size),
+            info.get("attention_backend"), info.get("speculative_draft_attention_backend"),
+        )
         args.token_grid = native_token_grid(info)
         save_json(folder / "server_info.json", credentials.redact(info))
     def trial(document, rows, bs, repeat, count, destination):
