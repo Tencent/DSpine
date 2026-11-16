@@ -177,7 +177,18 @@ class Workspace:
 
 
 def factor_table(
-    raw, rms, query, anchors, cand, cache, eps, t, out, base_out, workspace
+    raw,
+    rms,
+    query,
+    anchors,
+    cand,
+    cache,
+    eps,
+    t,
+    out,
+    base_out,
+    workspace,
+    candidate_head=None,
 ):
     """Compute conditional proposal logits with FP64 factors and direct fallback."""
     (n, k) = cand.shape
@@ -192,16 +203,14 @@ def factor_table(
     )
     assert anchors.shape == (bs,) and anchors.dtype == cand.dtype == torch.int64
     assert all(
-        (z.is_contiguous() for z in (raw, rms, query, anchors, cand, out, base_out))
+        z.is_contiguous() for z in (raw, rms, query, anchors, cand, out, base_out)
     )
     assert out.shape == (n, k, k) and out.dtype == torch.float32
     assert base_out.shape == (n, k) and base_out.dtype == torch.float64
     assert cache["W"].shape == (h, r) and cache["Gram"].shape == (r, r)
     assert all(
-        (
-            cache[name].dtype == torch.float64
-            for name in ("W", "Gram", "G", "V", "TG", "bias", "norm")
-        )
+        cache[name].dtype == torch.float64
+        for name in ("W", "Gram", "G", "V", "TG", "bias", "norm")
     )
     workspace.validate(n, k, h, r, raw.device)
     _prepare_x[n,](
@@ -235,13 +244,14 @@ def factor_table(
     )
     P.F._candidate_base[n * k,](
         workspace.x,
-        cache["head"],
+        cache["head"] if candidate_head is None else candidate_head.view(n * k, h),
         cache["norm"],
         cand,
         base_out,
         K=k,
         H=h,
         BH=triton.next_power_of_2(h),
+        HEAD_CANDIDATES=candidate_head is not None,
         num_warps=8,
     )
     product = torch.einsum("njr,ncr->njc", workspace.message, workspace.tg)
@@ -281,6 +291,7 @@ def factor_table(
         out,
         workspace.fallback,
         eps,
+        candidate_head=candidate_head,
     )
     torch._assert_async(
         torch.isfinite(out).all(),

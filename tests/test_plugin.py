@@ -186,14 +186,15 @@ def test_server_args_fields_exist_in_this_sglang():
     assert set(vars(_server_args())) <= set(field_names(ServerArgs))
 
 
-def test_dspine_envelope_then_dflash_resolution():
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_dspine_envelope_then_dflash_resolution(tp_size):
     with mock.patch("sglang.srt.arg_groups.speculative_hook._handle_dflash") as dflash:
-        ok = _server_args()
+        ok = _server_args(tp_size=tp_size)
         handle_dspine_server_args(ok)
         dflash.assert_called_once_with(ok)
+        assert ok.tp_size == tp_size
         for bad in (
             dict(device="cpu"),
-            dict(tp_size=2),
             dict(speculative_draft_window_size=512),
             dict(disaggregation_mode="decode"),
             dict(kv_cache_dtype="nvfp4"),

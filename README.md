@@ -127,7 +127,8 @@ sglang serve \
   --trust-remote-code
 ```
 
-Use `--speculative-draft-attention-backend triton` for Triton draft attention.
+Use `--tp-size N` for tensor parallelism and
+`--speculative-draft-attention-backend triton` for Triton draft attention.
 
 ## Apple Silicon (MLX)
 

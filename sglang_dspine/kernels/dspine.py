@@ -232,6 +232,7 @@ def _serial_table(
     BH: tl.constexpr,
     BR: tl.constexpr,
     WITH_CONFIDENCE: tl.constexpr,
+    HEAD_CANDIDATES: tl.constexpr,
 ):
     n = tl.program_id(0)
     b = n // TM1
@@ -249,8 +250,11 @@ def _serial_table(
         u = tl.load(Raw + row * stride_raw + off).to(tl.float32) * tl.load(
             NormW + off
         ).to(tl.float32)
+        head_row = n * K + kp if HEAD_CANDIDATES else ids
         w = tl.load(
-            LmW + ids[:, None] * stride_w + off[None, :], mask=live[:, None], other=0.0
+            LmW + head_row[:, None] * stride_w + off[None, :],
+            mask=live[:, None],
+            other=0.0,
         ).to(tl.float32)
         base += tl.sum(w * u[None, :], axis=1)
     s = tl.zeros([KP, KP], dtype=tl.float32)
@@ -360,6 +364,7 @@ def serial_table(
     gate_b,
     block_size: int,
     confidence=None,
+    candidate_head=None,
 ):
     """raw [bs*T, H] bf16 pre-write state of the last write; cand int64 [bs*(T-1), K] ascending;
     input_ids [bs*T]; packed [bs*T, >=R] bf16 with the receiver query in columns :R; rms fp32
@@ -369,6 +374,16 @@ def serial_table(
     (m, h) = raw.shape
     (n, k) = cand.shape
     rk = tg.shape[1]
+    if candidate_head is not None:
+        if (
+            candidate_head.shape != (n, k, h)
+            or candidate_head.dtype != torch.bfloat16
+            or not candidate_head.is_contiguous()
+        ):
+            raise ValueError(
+                "serial_table candidate head must be contiguous BF16 [N,K,H]"
+            )
+        lm_head_w = candidate_head.view(n * k, h)
     if m % t or n != m // t * (t - 1) or input_ids.numel() != m or (rms.numel() != m):
         raise ValueError(
             f"serial_table row mismatch: raw {raw.shape}, cand {cand.shape}, T={t}"
@@ -442,6 +457,7 @@ def serial_table(
             TM1=t - 1,
             BH=512,
             BR=128,
+            HEAD_CANDIDATES=candidate_head is not None,
             WITH_CONFIDENCE=confidence is not None,
             num_warps=8,
             num_stages=2,
@@ -505,6 +521,7 @@ def serial_rs_table(
     chunk_rows: int = 256,
     res_emb: torch.Tensor = None,
     res_proj: torch.Tensor = None,
+    candidate_head: torch.Tensor = None,
 ):
     """fp32 [n, K, K] sampling table of the serial last-write refinement (module docstring).
 
@@ -523,6 +540,14 @@ def serial_rs_table(
     bs = m // t
     (n, k) = cand.shape
     r = pred_gate_w.shape[0]
+    if candidate_head is not None and (
+        candidate_head.shape != (n, k, h)
+        or candidate_head.dtype != torch.bfloat16
+        or not candidate_head.is_contiguous()
+    ):
+        raise ValueError(
+            "serial_rs_table candidate head must be contiguous BF16 [N,K,H]"
+        )
     if (
         m % t
         or n != bs * (t - 1)
@@ -581,7 +606,9 @@ def serial_rs_table(
         normalized = (
             refined / torch.sqrt(refined.square().mean(-1, keepdim=True) + eps) * norm_w
         )
-        head = lm_head_w[cand[s:e]].to(f32)
+        head = (
+            lm_head_w[cand[s:e]] if candidate_head is None else candidate_head[s:e]
+        ).to(f32)
         out[s:e] = torch.einsum("njh,nch->njc", normalized, head)
     return out
 

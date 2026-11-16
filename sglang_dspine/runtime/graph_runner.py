@@ -12,4 +12,7 @@ class DSpineDraftCudaGraphRunner(DecodeCudaGraphRunner):
         if sampler is None:
             raise RuntimeError("DSPINE draft graph replayed before its sampler was set")
         sampler.after_graph_replay(forward_batch)
+        tp = getattr(getattr(sampler, "random", None), "tp", None)
+        if tp is not None:
+            tp.sync_proposal(sampler, int(forward_batch.batch_size))
         return output

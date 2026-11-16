@@ -17,6 +17,49 @@ from sglang_dspine.runtime.graph_runner import DSpineDraftCudaGraphRunner
 from sglang_dspine.runtime.worker import DSpineDraftSampler, DSpineWorkerV2
 
 
+def test_real_verify_caps_constructor_reads_resolved_tp_backend_metadata():
+    from sglang_dspine.verification import caps, policy
+
+    worker = types.SimpleNamespace(
+        block_size=16,
+        device="cpu",
+        _dspine_tp=types.SimpleNamespace(group=types.SimpleNamespace(world_size=2)),
+        draft_model_runner=types.SimpleNamespace(draft_attention_backend="triton"),
+    )
+    stop = RuntimeError("stop before GPU initialization")
+    with (
+        mock.patch(
+            "sglang.srt.runtime_context.get_exec",
+            return_value=types.SimpleNamespace(
+                kernel=types.SimpleNamespace(attention_backend="fa3")
+            ),
+        ),
+        mock.patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=types.SimpleNamespace(pp_size=1, attn_dp_enabled=False),
+        ),
+        mock.patch(
+            "sglang.srt.runtime_context.get_spec",
+            return_value=types.SimpleNamespace(
+                speculative_dspark_sps_table_path="profile.json"
+            ),
+        ),
+        mock.patch.object(policy, "hardware_identity", return_value={"gpu": "test"}),
+        mock.patch.object(
+            policy.SpsPolicy, "load_with_modes", side_effect=stop
+        ) as load,
+        pytest.raises(RuntimeError, match="stop before GPU initialization") as raised,
+    ):
+        caps.VerifyCaps(worker)
+    assert raised.value is stop
+    assert load.call_args.kwargs["execution"] == {
+        "tp_size": 2,
+        "draft_tp_size": 2,
+        "attention_backend": "fa3",
+        "draft_attention_backend": "triton",
+    }
+
+
 def _graph_runner(sampler):
     runner = object.__new__(DSpineDraftCudaGraphRunner)
     runner.model_runner = types.SimpleNamespace(
@@ -237,25 +280,56 @@ def test_sampled_verify_refuses_a_round_whose_sampled_chain_did_not_run():
 @pytest.mark.parametrize("fail", [False, True])
 def test_sampling_memory_witness_stages_synthetic_q_and_restores_live_state(fail):
     bs, width, k = 9, 16, 2
-    sampler = types.SimpleNamespace(k=k, _round_bs=3, _round_sampled=False,
+    sampler = types.SimpleNamespace(
+        k=k,
+        _round_bs=3,
+        _round_sampled=False,
         candidate_out=torch.full((bs, width - 1, k), 7, dtype=torch.int64),
-        q_out=torch.full((bs, width - 1, k), .25))
+        q_out=torch.full((bs, width - 1, k), 0.25),
+    )
     saved_ids, saved_q = sampler.candidate_out.clone(), sampler.q_out.clone()
+
     def verify(**kwargs):
         assert sampler._round_bs == bs and sampler._round_sampled
         assert torch.equal(sampler.candidate_out, kwargs["candidate_ids"])
         assert torch.equal(sampler.q_out, kwargs["q_rows"])
         assert torch.equal(sampler.q_out[..., 0], torch.ones(bs, width - 1))
-        if fail: raise RuntimeError("synthetic verifier failure")
+        if fail:
+            raise RuntimeError("synthetic verifier failure")
+
     worker = types.SimpleNamespace(
         _dspine_sampler=sampler, _dspine_verify=verify, target_distribution=None
     )
-    with mock.patch("torch.cuda.synchronize"), mock.patch("torch.cuda.reset_peak_memory_stats"), \
-         mock.patch("torch.cuda.memory_stats", return_value={"allocated_bytes.all.current":0, "allocated_bytes.all.peak":0}):
+    with (
+        mock.patch("torch.cuda.synchronize"),
+        mock.patch("torch.cuda.reset_peak_memory_stats"),
+        mock.patch(
+            "torch.cuda.memory_stats",
+            return_value={
+                "allocated_bytes.all.current": 0,
+                "allocated_bytes.all.peak": 0,
+            },
+        ),
+    ):
         if fail:
             with pytest.raises(RuntimeError, match="synthetic verifier failure"):
-                DSpineWorkerV2._measure_sampling_peak(worker, candidates=torch.zeros(bs, width), target_logits=torch.zeros(bs * width, 3), sampling_info=None)
+                DSpineWorkerV2._measure_sampling_peak(
+                    worker,
+                    candidates=torch.zeros(bs, width),
+                    target_logits=torch.zeros(bs * width, 3),
+                    sampling_info=None,
+                )
         else:
-            assert DSpineWorkerV2._measure_sampling_peak(worker, candidates=torch.zeros(bs, width), target_logits=torch.zeros(bs * width, 3), sampling_info=None)==0
+            assert (
+                DSpineWorkerV2._measure_sampling_peak(
+                    worker,
+                    candidates=torch.zeros(bs, width),
+                    target_logits=torch.zeros(bs * width, 3),
+                    sampling_info=None,
+                )
+                == 0
+            )
     assert sampler._round_bs == 3 and not sampler._round_sampled
-    assert torch.equal(sampler.candidate_out, saved_ids) and torch.equal(sampler.q_out, saved_q)
+    assert torch.equal(sampler.candidate_out, saved_ids) and torch.equal(
+        sampler.q_out, saved_q
+    )

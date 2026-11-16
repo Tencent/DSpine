@@ -154,9 +154,16 @@ def test_target_distribution_preserves_request_seeds_and_rng():
     distribution = TargetDistribution(SimpleNamespace(block_size=16))
     rng = torch.get_rng_state().clone()
     with (
-        patch("sglang_dspine.runtime.worker.build_dspine_target_probs", return_value=expected) as build,
-        patch("sglang.srt.runtime_context.get_exec", return_value=SimpleNamespace(
-            kernel=SimpleNamespace(sampling_backend="pytorch"))),
+        patch(
+            "sglang_dspine.runtime.worker.build_dspine_target_probs",
+            return_value=expected,
+        ) as build,
+        patch(
+            "sglang.srt.runtime_context.get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(sampling_backend="pytorch")
+            ),
+        ),
     ):
         assert distribution.dense(logits, info, 17) is expected
     assert build.call_args.kwargs["sampling_info"] is info
@@ -202,6 +209,7 @@ def test_worker_scope_and_registered_prefill_hook_honor_api_seed():
     plugin.register()
     HookRegistry.apply_hooks()
     worker = object.__new__(DSpineWorkerV2)
+    worker._dspine_tp = None
     worker.verify_caps = None
     worker._dspine_sampler = SimpleNamespace(optimized=False)
     sampler = object.__new__(Sampler)
@@ -248,3 +256,31 @@ def test_triton_draws_match_cpu_bitwise(stream):
     actual = torch.empty(5, 15)
     _uniforms[(5,)](seeds, positions, actual, 15, stream, 16)
     assert torch.equal(actual, seeded_uniforms(seeds, positions, 15, stream))
+
+
+def test_seeded_prefill_mixed_greedy_ties_use_lowest_argmax_and_one_hot_capture():
+    from sglang_dspine.sampling.random import sample_prefill
+
+    info = sampling_info(2, temperature=1.0, top_k=64, top_p=1.0)
+    info.is_any_greedy = True
+    info.top_ks = torch.tensor([1, 64], dtype=torch.int32)
+    info.top_ps.fill_(1.0)
+    info.sampling_seed = torch.tensor([2, -3])
+    info.sampling_mask_batch_indices = torch.tensor([0, 1])
+    probs = torch.full((2, 64), 1.0 / 64)
+    positions = torch.tensor([11, 29])
+    before = torch.get_rng_state().clone()
+    with patch(
+        "sglang.srt.runtime_context.get_exec",
+        return_value=SimpleNamespace(
+            kernel=SimpleNamespace(sampling_backend="pytorch")
+        ),
+    ):
+        tokens, capture = sample_prefill(probs, info, positions)
+    assert tokens[0] == probs[0].argmax() == 0
+    torch.testing.assert_close(
+        capture.weights[0], torch.nn.functional.one_hot(torch.tensor(0), 64).float()
+    )
+    torch.testing.assert_close(capture.weights[1], probs[1])
+    assert capture.selected_weight.tolist() == [1.0, 1.0 / 64]
+    assert torch.equal(before, torch.get_rng_state())

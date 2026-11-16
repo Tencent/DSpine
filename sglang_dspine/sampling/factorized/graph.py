@@ -76,9 +76,14 @@ class ProposalGraphs:
             sampler.norm_f32,
             sampler.lm_head_weight,
         )
-        self.source_tensors = tensors
-        self.source_signature = tuple(_signature(x) for x in tensors)
-        self.weights = build_cache(*tensors)
+        self.source_tensors = tensors + (sampler.res_emb, sampler.res_proj_f32)
+        self.source_signature = tuple(_signature(x) for x in self.source_tensors)
+        self.weights = build_cache(
+            *tensors,
+            res_emb=sampler.res_emb,
+            res_proj=sampler.res_proj_f32,
+            tp_head=getattr(sampler, "tp_head", None),
+        )
         self.weight_signature = tuple(
             (key, _signature(value)) for key, value in sorted(self.weights.items())
         )
@@ -121,6 +126,9 @@ class ProposalGraphs:
             output,
             base,
             workspace,
+            candidate_head=sampler.candidate_head[:n]
+            if getattr(sampler, "candidate_head", None) is not None
+            else None,
         )
 
     def lookup(self, bs):

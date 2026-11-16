@@ -57,6 +57,7 @@ def _unsafe_logits(
     K: tl.constexpr,
     EPS: tl.constexpr,
     BH: tl.constexpr,
+    HEAD_CANDIDATES: tl.constexpr,
 ):
     nj = tl.program_id(0)
     if not tl.load(Safe + nj):
@@ -67,8 +68,8 @@ def _unsafe_logits(
         denom = libdevice.sqrt_rn(mean_square + EPS)
         norm = tl.load(Norm + hs, hs < H, 0).to(tl.float64)
         z = y / denom * norm
-        for c in range(0, K):
-            cid = tl.load(Cand + n * K + c)
+        for c in range(K):
+            cid = n * K + c if HEAD_CANDIDATES else tl.load(Cand + n * K + c)
             head = tl.load(Head + cid * H + hs, hs < H, 0).to(tl.float64)
             value = tl.sum(z * head, axis=0)
             tl.store(Out + nj * K + c, value.to(tl.float32))
@@ -87,16 +88,17 @@ class Workspace:
         assert self.y.device == torch.device(device) and self.y.is_contiguous()
 
 
-def apply_direct_fallback(x, a, message, cand, cache, safe, out, workspace, eps):
+def apply_direct_fallback(
+    x, a, message, cand, cache, safe, out, workspace, eps, candidate_head=None
+):
     (n, k) = cand.shape
     h = x.shape[-1]
     r = message.shape[-1]
     workspace.validate(n, k, h, x.device)
+    head = cache["head"] if candidate_head is None else candidate_head.view(n * k, h)
     assert all(
-        (
-            z.is_contiguous()
-            for z in (x, a, message, cand, cache["W"], cache["norm"], cache["head"])
-        )
+        z.is_contiguous()
+        for z in (x, a, message, cand, cache["W"], cache["norm"], head)
     )
     assert safe.shape == (n, k) and safe.dtype == torch.bool and safe.is_contiguous()
     assert out.shape == (n, k, k) and out.dtype == torch.float32 and out.is_contiguous()
@@ -119,7 +121,7 @@ def apply_direct_fallback(x, a, message, cand, cache, safe, out, workspace, eps)
         _unsafe_logits[n * k,](
             workspace.y,
             cache["norm"],
-            cache["head"],
+            head,
             cand,
             safe,
             out,
@@ -127,6 +129,7 @@ def apply_direct_fallback(x, a, message, cand, cache, safe, out, workspace, eps)
             K=k,
             EPS=float(eps),
             BH=triton.next_power_of_2(h),
+            HEAD_CANDIDATES=candidate_head is not None,
             num_warps=8,
             enable_fp_fusion=False,
         )
@@ -135,5 +138,10 @@ def apply_direct_fallback(x, a, message, cand, cache, safe, out, workspace, eps)
             y = x[ni] + a[ni] * (cache["W"] @ message[ni, ji])
             workspace.y[ni, ji].copy_(y)
             z = y / torch.sqrt(y.square().mean() + eps) * cache["norm"]
-            out[ni, ji].copy_((cache["head"][cand[ni]].double() @ z).float())
+            selected = (
+                cache["head"][cand[ni]]
+                if candidate_head is None
+                else candidate_head[ni]
+            )
+            out[ni, ji].copy_((selected.double() @ z).float())
     return out

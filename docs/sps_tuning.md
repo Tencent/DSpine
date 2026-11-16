@@ -1,7 +1,7 @@
 # SPS tuning
 
 Tune verification budgets for your hardware and workload using the same serving
-settings as deployment.
+settings as deployment, including TP size and attention backends.
 
 ## 1. Prepare requests
 
@@ -45,6 +45,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/tune_sps.py \
   -- "${serve[@]}"
 ```
 
+For TP, use matching `--tp-size` and `CUDA_VISIBLE_DEVICES` settings when tuning and serving.
 Set `--batch-sizes` to cover the batches you expect, including smaller batches
 as requests finish. Keep the serving capacity at least as large as the maximum.
 Defaults are three repetitions and an output limit of 4096 tokens; see `--help`
