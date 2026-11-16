@@ -735,18 +735,9 @@ class DSpineWorkerV2(DFlashWorkerV2):
     def init_attention_backends(self):
         super().init_attention_backends()
         if self.draft_model.native_swa_window is not None:
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
+            from sglang_dspine.layers.attention import validate_native_swa_backend
 
-            runner = self.draft_model_runner
-            backend = runner.attn_backend
-            if type(backend) is not FlashAttentionBackend or backend.fa_impl_ver != int(
-                runner.draft_attention_backend[-1]
-            ):
-                raise ValueError(
-                    "Native DSPINE SWA candidate requires the resolved FA3/FA4 backend itself"
-                )
+            validate_native_swa_backend(self.draft_model_runner)
 
     def alloc_memory_pool(self, *args, **kwargs):
         result = super().alloc_memory_pool(*args, **kwargs)
