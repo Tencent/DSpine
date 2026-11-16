@@ -65,6 +65,8 @@ def handle_dspine_server_args(server_args) -> None:
         raise ValueError(
             f"DSPINE speculative decoding requires CUDA, got device={cfg.device!r}."
         )
+    if cfg.rl_on_policy_target is not None:
+        raise ValueError("DSPINE does not support --rl-on-policy-target.")
     if cfg.speculative_draft_window_size is not None:
         raise ValueError("DSPINE does not support --speculative-draft-window-size.")
     if cfg.disaggregation_mode != "null":

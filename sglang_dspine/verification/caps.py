@@ -176,9 +176,7 @@ class VerifyCaps:
     def policy_for_mode(self, mode):
         # Old controller fixtures only supply self.policy; legacy files have no
         # overrides. Retain their shared policy without inheriting a last mode.
-        return getattr(self, "mode_policies", {}).get(
-            mode, getattr(self, "default_policy", self.policy)
-        )
+        return getattr(self, "mode_policies", {}).get(mode, getattr(self, "default_policy", self.policy))
 
     def begin(self, batch):
         greedy = (
@@ -404,7 +402,6 @@ def around_target(original, target_worker, *args, **kwargs):
 
 def register_verify_cap_hooks():
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
     from sglang_dspine.sampling.compact import around_verify_logits_adjustments
 
     HookRegistry.register(

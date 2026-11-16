@@ -18,21 +18,15 @@ class SpsPolicy:
             (self.token_budgets, "token_budgets"),
         ):
             if not isinstance(values, dict):
-                raise ValueError(
-                    f"SPS {name} must map positive batch sizes to integers"
-                )
+                raise ValueError(f"SPS {name} must map positive batch sizes to integers")
             for bs, value in values.items():
                 if type(bs) is not int or bs < 1 or type(value) is not int:
-                    raise ValueError(
-                        f"SPS {name} requires positive integer batch sizes"
-                    )
+                    raise ValueError(f"SPS {name} requires positive integer batch sizes")
                 lower, upper = (1, 16) if name == "verify_widths" else (bs, bs * 16)
                 if not lower <= value <= upper:
                     raise ValueError(f"SPS {name}[{bs}] must be in [{lower}, {upper}]")
         if self.verify_widths.keys() & self.token_budgets.keys():
-            raise ValueError(
-                "SPS batch sizes must use either a width or a token budget"
-            )
+            raise ValueError("SPS batch sizes must use either a width or a token budget")
 
     def width(self, bs, full=16):
         return min(full, self.verify_widths.get(bs, full))
@@ -42,12 +36,8 @@ class SpsPolicy:
 
     def to_dict(self):
         return {
-            "verify_widths": {
-                str(bs): w for bs, w in sorted(self.verify_widths.items())
-            },
-            "token_budgets": {
-                str(bs): n for bs, n in sorted(self.token_budgets.items())
-            },
+            "verify_widths": {str(bs): w for bs, w in sorted(self.verify_widths.items())},
+            "token_budgets": {str(bs): n for bs, n in sorted(self.token_budgets.items())},
         }
 
     @classmethod
@@ -113,12 +103,10 @@ class SpsPolicy:
         names = ("verify_widths", "token_budgets")
         if set(policy) - set(names):
             raise ValueError("Unknown fields in DSpine SPS policy")
-        return cls(
-            **{
-                name: {int(bs): value for bs, value in policy.get(name, {}).items()}
-                for name in names
-            }
-        )
+        return cls(**{
+            name: {int(bs): value for bs, value in policy.get(name, {}).items()}
+            for name in names
+        })
 
 
 def hardware_identity(device):

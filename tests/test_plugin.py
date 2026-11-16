@@ -145,6 +145,7 @@ def _server_args(**overrides):
     fields = dict(
         device="cuda",
         tp_size=1,
+        rl_on_policy_target=None,
         speculative_draft_window_size=None,
         disaggregation_mode="null",
         kv_cache_dtype="auto",
@@ -195,6 +196,7 @@ def test_dspine_envelope_then_dflash_resolution(tp_size):
         assert ok.tp_size == tp_size
         for bad in (
             dict(device="cpu"),
+            dict(rl_on_policy_target="fsdp"),
             dict(speculative_draft_window_size=512),
             dict(disaggregation_mode="decode"),
             dict(kv_cache_dtype="nvfp4"),

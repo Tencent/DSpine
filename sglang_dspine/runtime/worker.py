@@ -20,7 +20,8 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     is_dflash_sampling_verify_available,
 )
-from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2, _commit_accept
+from sglang.srt.speculative.dflash_worker_v2 import SIMULATE_ACC_LEN, DFlashWorkerV2
+from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 
 from sglang_dspine.kernels import dspine as dspine_kernels
 from sglang_dspine.models.dspine import DSpineDraftModel
@@ -284,10 +285,11 @@ class DSpineDraftSampler:
                 head = self.tp_head
                 logits[:, head.num_local :].fill_(float("-inf"))
                 width = min(k, logits.shape[1])
-                order = torch.argsort(logits, dim=-1, descending=True, stable=True)[
-                    :, :width
-                ]
-                values = logits.gather(-1, order)
+                from flashinfer.topk import top_k
+
+                from sglang_dspine.layers.fp8.coarse import stable_local_topk
+
+                values, order = stable_local_topk(logits, width, top_k)
                 ids = order + head.start
                 values = values.masked_fill(ids >= head.end, float("-inf"))
                 ids = ids.masked_fill(ids >= head.end, head.global_vocab_size)
@@ -740,6 +742,7 @@ class DSpineWorkerV2(DFlashWorkerV2):
 
     def _accept_block(self, **kwargs):
         controller = getattr(self, "verify_caps", None)
+        native_site = None
         if (
             controller is not None
             and controller.in_round
@@ -748,12 +751,25 @@ class DSpineWorkerV2(DFlashWorkerV2):
             result = controller.accept(**kwargs)
         else:
             result = super()._accept_block(**kwargs)
+            if self._selector_sample is not None:
+                native_site = SpecTpSyncSite.DFLASH_SELECTOR
+            elif (
+                not _is_all_greedy(kwargs["sampling_info"])
+                and is_dflash_sampling_verify_available()
+            ):
+                native_site = SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE
+            else:
+                native_site = SpecTpSyncSite.DFLASH_ACCEPT_GREEDY
         tp = getattr(self, "_dspine_tp", None)
-        if tp is not None and tp.enabled:
-            accept, bonus = tp.sync_accept(result[0], result[2])
-            out, commit = _commit_accept(kwargs["candidates"], accept, bonus)
-            new_seq = kwargs["prefix_lens"] + commit.to(kwargs["prefix_lens"].dtype)
-            result = (accept, commit, bonus, out, new_seq)
+        if tp is not None and tp.enabled and (
+            native_site is None
+            or not self._tp_sync.enabled(native_site)
+            or SIMULATE_ACC_LEN > 0
+        ):
+            # Native DFlash already synchronizes before committing. Caps/ragged
+            # bypass it; env-disabled sites and post-sync simulation also need
+            # mandatory agreement. Share their existing buffers without recommit.
+            tp.sync_accept(*result)
         if controller is not None and hasattr(controller, "observe"):
             controller.observe(result[0])
         return result

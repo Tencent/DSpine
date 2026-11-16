@@ -15,6 +15,7 @@ class DSpineTpCoordinator:
         self.group = group
         self.enabled = group.world_size > 1
         self.is_leader = group.rank_in_group == 0
+        self._accept_packets = {}
         self._layout_packets = {}
 
     def sync_tensor(self, value):
@@ -63,9 +64,12 @@ class DSpineTpCoordinator:
         if sampler.confidence_out is not None:
             self.sync_tensor(sampler.confidence_out[:bs])
 
-    def sync_accept(self, accept_len, bonus):
-        """Call before deriving output, commit lengths or local cache updates."""
-        return self.sync_tensor(accept_len), self.sync_tensor(bonus)
+    def sync_accept(self, *values):
+        """Share existing acceptance buffers in place, before cache updates."""
+        self._sync_values(
+            tuple(value for value in values if value is not None), self._accept_packets
+        )
+        return values
 
     def sync_layout(self, layout, index):
         """Share a replayed planner's outputs without replacing static buffers."""
@@ -77,12 +81,18 @@ class DSpineTpCoordinator:
             layout.qo_indptr_device,
             index,
         )
+        self._sync_values(values, self._layout_packets)
+
+    def _sync_values(self, values, packets):
+        """One integer packet; copies retain graph/double-buffer storage and dtypes."""
+        if not self.enabled or not values:
+            return
         size = sum(value.numel() for value in values)
-        key = (index.device, size)
-        packet = self._layout_packets.get(key)
+        key = (values[0].device, size)
+        packet = packets.get(key)
         if packet is None:
-            packet = torch.empty(size, device=index.device, dtype=torch.int64)
-            self._layout_packets[key] = packet
+            packet = torch.empty(size, device=values[0].device, dtype=torch.int64)
+            packets[key] = packet
         offset = 0
         for value in values:
             end = offset + value.numel()

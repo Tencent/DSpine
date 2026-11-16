@@ -154,16 +154,9 @@ def test_target_distribution_preserves_request_seeds_and_rng():
     distribution = TargetDistribution(SimpleNamespace(block_size=16))
     rng = torch.get_rng_state().clone()
     with (
-        patch(
-            "sglang_dspine.runtime.worker.build_dspine_target_probs",
-            return_value=expected,
-        ) as build,
-        patch(
-            "sglang.srt.runtime_context.get_exec",
-            return_value=SimpleNamespace(
-                kernel=SimpleNamespace(sampling_backend="pytorch")
-            ),
-        ),
+        patch("sglang_dspine.runtime.worker.build_dspine_target_probs", return_value=expected) as build,
+        patch("sglang.srt.runtime_context.get_exec", return_value=SimpleNamespace(
+            kernel=SimpleNamespace(sampling_backend="pytorch"))),
     ):
         assert distribution.dense(logits, info, 17) is expected
     assert build.call_args.kwargs["sampling_info"] is info

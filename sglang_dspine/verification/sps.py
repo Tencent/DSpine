@@ -40,8 +40,7 @@ def allocate_verify_lens(raw, probabilities, depth, budget, boundaries=None):
         raise ValueError("SPS budget must include every root and fit the draft block")
     n_bins = probabilities.shape[-1]
     bins = (
-        torch.bucketize(raw.contiguous(), boundaries)
-        if boundaries is not None
+        torch.bucketize(raw.contiguous(), boundaries) if boundaries is not None
         else (raw * n_bins).to(torch.int64).clamp_(0, n_bins - 1)
     )
     conditional = probabilities[depth, bins]
