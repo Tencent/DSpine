@@ -1,11 +1,24 @@
 """Row-scaled FP8 retrieval; final scores use the original BF16 head."""
 
+from functools import cache
+
 import torch
 
 
+@cache
+def supports_filtered_topk(device):
+    """Cache FlashInfer's native capability result for an explicit tensor device."""
+    if device.type != "cuda":
+        return False
+    from flashinfer.topk import can_implement_filtered_topk
+
+    with torch.cuda.device(device):
+        return can_implement_filtered_topk()
+
+
 def stable_local_topk(scores, k, fi_top_k):
-    """Use FlashInfer's deterministic lower-index boundary tie selection."""
-    if scores.device.type != "cuda":
+    """Select boundary ties by lower index on every supported device."""
+    if not supports_filtered_topk(scores.device):
         ids = torch.argsort(scores, dim=-1, descending=True, stable=True)[..., :k]
         return scores.gather(-1, ids), ids
     values, ids = fi_top_k(
@@ -42,6 +55,7 @@ class FullVFP8Coarse:
         self.torch = torch
         self.original_weight = original_weight
         self.tp_head = tp_head
+        supports_filtered_topk(original_weight.device)
         vocab, hidden = original_weight.shape
         self.weight8 = torch.empty(
             (vocab, hidden), device=original_weight.device, dtype=torch.float8_e4m3fn
@@ -71,7 +85,10 @@ class FullVFP8Coarse:
             use_fast_accum=False,
         )
         if self.tp_head is None:
-            ids = fi_top_k(coarse, 128, sorted=False, dsa_graph_safe=True)[1]
+            if supports_filtered_topk(coarse.device):
+                ids = fi_top_k(coarse, 128, sorted=False, dsa_graph_safe=True)[1]
+            else:
+                ids = stable_local_topk(coarse, 128, fi_top_k)[1]
             scores = gather_ops.rescore(torch, self.original_weight, ids, hidden)
         else:
             head = self.tp_head

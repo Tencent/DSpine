@@ -24,6 +24,7 @@ from sglang.srt.speculative.dflash_worker_v2 import SIMULATE_ACC_LEN, DFlashWork
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 
 from sglang_dspine.kernels import dspine as dspine_kernels
+from sglang_dspine.layers.fp8.coarse import supports_filtered_topk
 from sglang_dspine.models.dspine import DSpineDraftModel
 from sglang_dspine.runtime.tp_sync import DSpineTpCoordinator
 from sglang_dspine.sampling.random import (
@@ -99,6 +100,7 @@ class DSpineDraftSampler:
         self.draft_model = draft_model
         self.lm_head_weight = lm_head_weight
         self.tp_head = tp_head
+        supports_filtered_topk(lm_head_weight.device)
         self.block_size = int(block_size)
         self.k = int(draft_model.head_topk)
         self.max_bs = int(max_bs)
