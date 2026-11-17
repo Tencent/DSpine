@@ -19,7 +19,9 @@ def supports_filtered_topk(device):
 def stable_local_topk(scores, k, fi_top_k):
     """Select boundary ties by lower index on every supported device."""
     if not supports_filtered_topk(scores.device):
-        ids = torch.argsort(scores, dim=-1, descending=True, stable=True)[..., :k]
+        ids = torch.argsort(scores, dim=-1, descending=True, stable=True)[
+            ..., :k
+        ].contiguous()
         return scores.gather(-1, ids), ids
     values, ids = fi_top_k(
         scores,

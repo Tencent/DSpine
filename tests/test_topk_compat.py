@@ -79,6 +79,7 @@ def test_cpu_topk_keeps_lower_ids_at_ties(dtype, k):
         ]
     )
     values, ids = coarse.stable_local_topk(scores, k, _forbidden_flashinfer)
+    assert ids.is_contiguous(), "Pointer-based gather kernels require packed rows"
     torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
     torch.testing.assert_close(values, scores.gather(-1, expected_ids), rtol=0, atol=0)
 
