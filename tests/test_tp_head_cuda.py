@@ -28,7 +28,21 @@ class _Group:
         return value
 
 
-def _cuda_worker(rank, rendezvous, world_size):
+def _cpu_topk_ids(scores, k):
+    return torch.tensor(
+        [
+            sorted(range(len(row)), key=lambda token: (-row[token], token))[:k]
+            for row in scores.cpu().float().tolist()
+        ],
+        device=scores.device,
+    )
+
+
+def _forbidden_flashinfer(*args, **kwargs):
+    raise AssertionError("FlashInfer must not run on the portable path")
+
+
+def _cuda_worker(rank, rendezvous, world_size, portable):
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size
@@ -37,6 +51,7 @@ def _cuda_worker(rank, rendezvous, world_size):
         from flashinfer.topk import top_k
 
         from sglang_dspine.kernels import dspine as kernels
+        from sglang_dspine.layers.fp8 import coarse as coarse_ops
         from sglang_dspine.layers.fp8 import gather as gather_ops
         from sglang_dspine.layers.fp8.coarse import FullVFP8Coarse, stable_local_topk
         from sglang_dspine.sampling.factorized.cancellation import (
@@ -48,6 +63,10 @@ def _cuda_worker(rank, rendezvous, world_size):
         from sglang_dspine.sampling.factorized.kernels import Workspace, factor_table
         from sglang_dspine.sampling.factorized.weights import build_cache
         from sglang_dspine.sampling.tp_head import TPHead, merge_topk
+
+        if portable:
+            coarse_ops.supports_filtered_topk = lambda device: False
+            top_k = _forbidden_flashinfer
 
         torch.manual_seed(884)
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -69,20 +88,25 @@ def _cuda_worker(rank, rendezvous, world_size):
         result, coarse_ids, _ = local.retrieve_and_rescore(
             hidden, fi_top_k=top_k, gather_ops=gather_ops
         )
-        scale = hidden.float().abs().amax(-1, keepdim=True) / 448
-        q = (hidden.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
-        scores = torch._scaled_mm(
-            q,
-            local.weight8_t,
-            scale,
-            local.weight_scale,
-            out_dtype=torch.bfloat16,
-            use_fast_accum=False,
-        )
-        scores[:, end - start :] = -torch.inf
-        all_scores = head.gather_vocab_rows(scores[:, : end - start].T).T.contiguous()
-        global_ids = torch.arange(v, device="cuda").expand(n, v)
-        _, expected_coarse = merge_topk(all_scores, global_ids, 128)
+        def coarse_reference():
+            scale = hidden.float().abs().amax(-1, keepdim=True) / 448
+            q = (hidden.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+            scores = torch._scaled_mm(
+                q,
+                local.weight8_t,
+                scale,
+                local.weight_scale,
+                out_dtype=torch.bfloat16,
+                use_fast_accum=False,
+            )
+            scores[:, end - start :] = -torch.inf
+            all_scores = head.gather_vocab_rows(scores[:, : end - start].T).T.contiguous()
+            if portable:
+                return _cpu_topk_ids(all_scores, 128)
+            global_ids = torch.arange(v, device="cuda").expand(n, v)
+            return merge_topk(all_scores, global_ids, 128)[1]
+
+        expected_coarse = coarse_reference()
         torch.testing.assert_close(coarse_ids, expected_coarse, rtol=0, atol=0)
         expected = gather_ops.select16(
             torch,
@@ -90,6 +114,34 @@ def _cuda_worker(rank, rendezvous, world_size):
             expected_coarse,
         )
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        if portable:
+            for _ in range(3):
+                local.retrieve_and_rescore(
+                    hidden, fi_top_k=top_k, gather_ops=gather_ops
+                )
+            torch.cuda.synchronize()
+            coarse_graph = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.graph(coarse_graph):
+                    replay_result, replay_coarse, _ = local.retrieve_and_rescore(
+                        hidden, fi_top_k=top_k, gather_ops=gather_ops
+                    )
+                for _ in range(2):
+                    hidden.neg_()
+                    expected_coarse = coarse_reference()
+                    expected = gather_ops.select16(
+                        torch,
+                        gather_ops.rescore(torch, full, expected_coarse, hidden),
+                        expected_coarse,
+                    )
+                    coarse_graph.replay()
+                    torch.testing.assert_close(
+                        replay_coarse, expected_coarse, rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(replay_result, expected, rtol=0, atol=0)
+                torch.cuda.synchronize()
+            finally:
+                coarse_graph.reset()
         for tied in (
             torch.zeros(n, 256, device="cuda", dtype=torch.bfloat16),
             torch.arange(256, device="cuda")
@@ -100,9 +152,7 @@ def _cuda_worker(rank, rendezvous, world_size):
         ):
             for local_k in (16, 128):
                 values, ids = stable_local_topk(tied, local_k, top_k)
-                expect_ids = torch.argsort(tied, dim=-1, descending=True, stable=True)[
-                    :, :local_k
-                ]
+                expect_ids = _cpu_topk_ids(tied, local_k)
                 torch.testing.assert_close(
                     ids.sort(-1).values, expect_ids.sort(-1).values, rtol=0, atol=0
                 )
@@ -234,14 +284,18 @@ def _cuda_worker(rank, rendezvous, world_size):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_sharded_head_and_refinement(world_size):
+@pytest.mark.parametrize(
+    ("world_size", "portable"),
+    [(2, False), (4, False), (2, True)],
+    ids=["tp2-native", "tp4-native", "tp2-portable"],
+)
+def test_sharded_head_and_refinement(world_size, portable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"{world_size} CUDA devices required")
     with tempfile.TemporaryDirectory() as directory:
         mp.spawn(
             _cuda_worker,
-            args=(str(Path(directory) / "rendezvous"), world_size),
+            args=(str(Path(directory) / "rendezvous"), world_size, portable),
             nprocs=world_size,
             join=True,
         )
