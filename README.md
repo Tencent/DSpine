@@ -99,6 +99,12 @@ sglang serve \
 The implementation uses [DSpark](https://github.com/deepseek-ai/DeepSpec)-based
 dynamic verification and [ReplaySSM](https://github.com/Johnny-Liou/ReplaySSM).
 
+On an RTX PRO 6000 Blackwell (SM120), use `--attention-backend triton`
+and `--speculative-draft-attention-backend fa4` in the command below to
+run the causal sliding-window draft with native FlashAttention 4. SGLang
+0.5.22 restricts FA4 for the full-attention layers of this hybrid GDN
+target on SM120. Keep `--linear-attn-backend triton` for the GDN layers.
+
 Run [SPS tuning](docs/sps_tuning.md) with your serving settings to tune dynamic verification.
 Add `--speculative-dspark-sps-table-path sps.json` to the command below to load the result.
 

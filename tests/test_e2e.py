@@ -2,6 +2,8 @@
 Requires GPUs, the installed plugin, and a target/draft model pair:
     DSPINE_TARGET_MODEL=<target> DSPINE_DRAFT_MODEL=<draft> pytest tests/test_e2e.py
 Skipped when either model environment variable is unset.
+Set DSPINE_TARGET_BACKEND and DSPINE_DRAFT_BACKEND to test a different backend
+pair (e.g. triton/fa4 on SM120 with stock SGLang 0.5.22).
 """
 
 import os
@@ -13,6 +15,8 @@ from transformers import AutoConfig
 
 TARGET_MODEL = os.environ.get("DSPINE_TARGET_MODEL")
 DRAFT_MODEL = os.environ.get("DSPINE_DRAFT_MODEL")
+TARGET_BACKEND = os.environ.get("DSPINE_TARGET_BACKEND", "fa3")
+DRAFT_BACKEND = os.environ.get("DSPINE_DRAFT_BACKEND", "triton")
 if not (TARGET_MODEL and DRAFT_MODEL):
     pytest.skip(
         "set DSPINE_TARGET_MODEL and DSPINE_DRAFT_MODEL", allow_module_level=True
@@ -62,9 +66,9 @@ class TestDSpineServer(CustomTestCase):
             "--dtype",
             "bfloat16",
             "--attention-backend",
-            "fa3",
+            TARGET_BACKEND,
             "--speculative-draft-attention-backend",
-            "triton",
+            DRAFT_BACKEND,
             "--mem-fraction-static",
             "0.7",
             "--context-length",
@@ -137,6 +141,8 @@ class TestDSpineServer(CustomTestCase):
         response.raise_for_status()
         info = response.json()
         self.assertEqual(info["speculative_algorithm"], "DSPINE")
+        self.assertEqual(info["attention_backend"], TARGET_BACKEND)
+        self.assertEqual(info["speculative_draft_attention_backend"], DRAFT_BACKEND)
 
     def test_greedy_requests(self):
         self._assert_speculates(self._generate([GREEDY] * len(PROMPTS)))

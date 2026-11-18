@@ -24,7 +24,7 @@ def backend_types(monkeypatch):
         result[name] = type(class_name, (), {})
         setattr(stub, class_name, result[name])
         monkeypatch.setitem(sys.modules, path, stub)
-    return result
+    return {**result, "fa4": result["fa3"]}
 
 
 def runner(name, backend=None, **overrides):
@@ -38,7 +38,7 @@ def runner(name, backend=None, **overrides):
     return SimpleNamespace(**fields)
 
 
-@pytest.mark.parametrize("name", ["fa3", "triton"])
+@pytest.mark.parametrize("name", ["fa3", "fa4", "triton"])
 def test_supported_backend_preserves_swa_contract(name):
     validate_native_swa_runner(runner(name), served_block_size=16)
     with pytest.raises(ValueError, match="window_left"):
@@ -53,31 +53,36 @@ def test_supported_backend_preserves_swa_contract(name):
         validate_native_swa_runner(runner(name), served_block_size=8)
 
 
-@pytest.mark.parametrize("name", [None, "fa4", "flashinfer"])
+@pytest.mark.parametrize("name", [None, "flashinfer"])
 def test_other_draft_backends_remain_rejected(name):
-    with pytest.raises(ValueError, match="fa3 or triton"):
+    with pytest.raises(ValueError, match="fa3, fa4, or triton"):
         validate_native_swa_runner(runner(name), served_block_size=16)
 
 
-@pytest.mark.parametrize("name", ["fa3", "triton"])
-def test_selection_checks_the_resolved_backend(name, backend_types):
+@pytest.mark.parametrize("name, version", [("fa3", 3), ("fa4", 4), ("triton", None)])
+def test_selection_checks_the_resolved_backend(name, version, backend_types):
     backend = backend_types[name]()
-    if name == "fa3":
-        backend.fa_impl_ver = 3
+    if version is not None:
+        backend.fa_impl_ver = version
     validate_native_swa_backend(runner(name, backend))
     with pytest.raises(ValueError, match="incompatible"):
         validate_native_swa_backend(runner(name, object()))
 
 
-def test_fa3_cannot_resolve_to_fa4(backend_types):
-    backend = backend_types["fa3"]()
-    backend.fa_impl_ver = 4
+@pytest.mark.parametrize("name, wrong_version", [("fa3", 4), ("fa4", 3)])
+def test_flash_attention_cannot_silently_change_version(
+    name, wrong_version, backend_types
+):
+    backend = backend_types[name]()
+    backend.fa_impl_ver = wrong_version
     with pytest.raises(ValueError, match="incompatible"):
-        validate_native_swa_backend(runner("fa3", backend))
+        validate_native_swa_backend(runner(name, backend))
 
 
-@pytest.mark.parametrize("name", ["fa3", "triton"])
-def test_backend_cannot_resolve_to_the_other_implementation(name, backend_types):
-    backend = backend_types["triton" if name == "fa3" else "fa3"]()
+@pytest.mark.parametrize(
+    "name, other", [("fa3", "triton"), ("fa4", "triton"), ("triton", "fa4")]
+)
+def test_backend_cannot_resolve_to_the_other_implementation(name, other, backend_types):
+    backend = backend_types[other]()
     with pytest.raises(ValueError, match="incompatible"):
         validate_native_swa_backend(runner(name, backend))
