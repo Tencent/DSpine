@@ -21,6 +21,7 @@ modeled during parallel drafting.
 
 ## News
 
+- **[2026-11]** DSpine is now supported in [vLLM](https://github.com/vllm-project/vllm/pull/67094).
 - **[2026-11]** Added support for Qwen3.8-27B inference.
 - **[2026-11]** 🍎 Added support for Apple Silicon inference via mlx-lm and SGLang-MLX.
 - **[2026-10]** 🚀 [Training code](https://github.com/sgl-project/SpecForge/pull/1038) released in SpecForge.
@@ -62,7 +63,9 @@ Acceptance length on Qwen3-8B. DSpine, DSpark and DFlash2 are trained on the sam
 
 We evaluate Qwen3.8-27B on [WorkBuddy Bench](https://github.com/Tencent/workbuddy-bench) using trajectories collected in the CodeBuddy sandbox. See the [model card](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) for acceptance length and throughput results.
 
-## Installation
+## Deployment
+
+### SGLang
 
 The SGLang plugin uses SGLang 0.5.22 and requires Python 3.11+ and CUDA.
 
@@ -72,9 +75,7 @@ cd dspine
 python -m pip install -e .
 ```
 
-## Usage
-
-### Qwen3-8B
+#### Qwen3-8B
 
 ```bash
 sglang serve \
@@ -93,7 +94,7 @@ sglang serve \
   --trust-remote-code
 ```
 
-### Qwen3.8-27B
+#### Qwen3.8-27B
 
 The implementation uses [DSpark](https://github.com/deepseek-ai/DeepSpec)-based
 dynamic verification and [ReplaySSM](https://github.com/Johnny-Liou/ReplaySSM).
@@ -129,6 +130,25 @@ sglang serve \
 
 Use `--tp-size N` for tensor parallelism and
 `--speculative-draft-attention-backend triton` for Triton draft attention.
+
+### vLLM
+
+Install [vLLM from main](https://github.com/vllm-project/vllm/blob/main/docs/getting_started/installation/gpu.cuda.inc.md#python-only-build), then serve Qwen3.8-27B with the DSpine draft:
+
+```bash
+vllm serve Qwen/Qwen3.8-27B \
+  --language-model-only \
+  --speculative-config '{
+    "method": "dflash",
+    "model": "tencent/Qwen3.8-27B-DSpine-b16",
+    "num_speculative_tokens": 15
+  }'
+```
+
+Set `num_speculative_tokens` to the draft block size minus one.
+For probabilistic draft sampling, add `"draft_sample_method": "probabilistic"`;
+for adaptive verification, add `"enable_adaptive_verification": true` to the speculative config.
+See the [vLLM DSpine guide](https://github.com/vllm-project/vllm/blob/main/docs/features/speculative_decoding/README.md#dspine).
 
 ## Apple Silicon (MLX)
 
