@@ -60,19 +60,20 @@ def _accept(
     Prefix,
     NewSeq,
     T: tl.constexpr,
+    WIDTH: tl.constexpr,
 ):
     b = tl.program_id(0)
-    i = tl.arange(0, T)
+    i = tl.arange(0, WIDTH)
     cap = tl.load(Lens + b)
     proposed = tl.load(Candidates + b * T + i + 1, i < T - 1, 0)
-    predicted = tl.load(Top1 + b * T + i)
+    predicted = tl.load(Top1 + b * T + i, i < T, 0)
     matched = (i < cap - 1) & (proposed == predicted)
     accepted = tl.minimum(tl.min(tl.where(matched, T, i), 0), cap - 1)
     bonus = tl.load(Top1 + b * T + accepted)
     tl.store(Accept + b, accepted)
     tl.store(Commit + b, accepted + 1)
     tl.store(Bonus + b, bonus)
-    tl.store(Output + b * T + i, tl.where(i == accepted, bonus, proposed))
+    tl.store(Output + b * T + i, tl.where(i == accepted, bonus, proposed), i < T)
     tl.store(NewSeq + b, tl.load(Prefix + b) + accepted + 1)
 
 
@@ -82,8 +83,10 @@ class RaggedVerifyCaps(VerifyCaps):
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
-        if self.full != 16:
-            raise ValueError("Ragged verification requires draft block16")
+        if not 2 <= self.full <= 16:
+            raise ValueError(
+                f"Ragged verification requires draft block size 2..16, got {self.full}"
+            )
         self.tokens = self.batch_size = 0
         self.lens_cpu = self.lens_tensor_cpu = None
         self.ragged_backend = self.ragged_graph = None
@@ -331,5 +334,6 @@ class RaggedVerifyCaps(VerifyCaps):
             prefix_lens,
             new_seq,
             T=self.full,
+            WIDTH=triton.next_power_of_2(self.full),
         )
         return (accept, commit, bonus, output, new_seq)

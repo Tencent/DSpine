@@ -22,6 +22,27 @@ _public = None
 _registered = False
 
 
+def _served_block_size(runner):
+    from sglang_dspine.runtime import worker as worker_module
+
+    active = worker_module._active_worker
+    if active is not None and getattr(active, "block_size", None) is not None:
+        return int(active.block_size)
+    try:
+        from sglang.srt.runtime_context import get_spec
+
+        value = get_spec().speculative_num_draft_tokens
+    except Exception:
+        value = None
+    if value is None:
+        value = getattr(
+            getattr(runner, "server_args", None),
+            "speculative_num_draft_tokens",
+            None,
+        )
+    return value if type(value) is int else None
+
+
 def _pool(runner):
     from sglang_dspine.spec import is_dspine
 
@@ -33,6 +54,20 @@ def _pool(runner):
         or not pool.enable_linear_replayssm_spec
         or getattr(pool, "replayssm_is_kda", False)
         or getattr(pool, "replayssm_spec_fold", False)
+    ):
+        return None
+    # Empty-history specialization requires commit_gdn_replayssm_spec to fold
+    # after every commit (new_wp + 2 * block_size > max_cache_len for all new_wp >= 1),
+    # which holds iff 2 * served_block_size >= max_cache_len.
+    req_pool = runner.req_to_token_pool
+    get_state = getattr(req_pool, "get_speculative_mamba2_params_all_layers", None)
+    state = get_state() if callable(get_state) else None
+    d_cache = getattr(state, "replayssm_d", None)
+    served_block = _served_block_size(runner)
+    if (
+        d_cache is None
+        or served_block is None
+        or 2 * served_block < int(d_cache.shape[-2])
     ):
         return None
     return pool

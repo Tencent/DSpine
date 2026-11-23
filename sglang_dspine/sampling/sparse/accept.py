@@ -227,6 +227,7 @@ def _accept_sparse(
     Output,
     NewSeq,
     T: tl.constexpr,
+    T_PAD: tl.constexpr,
     V: tl.constexpr,
     CAP: tl.constexpr,
     K: tl.constexpr,
@@ -300,10 +301,10 @@ def _accept_sparse(
     tl.store(Accept + b, accepted)
     tl.store(Commit + b, accepted + 1)
     tl.store(Bonus + b, bonus)
-    i = tl.arange(0, T)
+    i = tl.arange(0, T_PAD)
     proposed = tl.load(Candidates + b * T + i + 1, i < T - 1, 0)
     emitted = tl.where(i < accepted, proposed, tl.where(i == accepted, bonus, 0))
-    tl.store(Output + b * T + i, emitted)
+    tl.store(Output + b * T + i, emitted, i < T)
     tl.store(NewSeq + b, tl.load(Prefix + b) + accepted + 1)
 
 
@@ -508,7 +509,7 @@ def accept_sparse(
         if raw_fallback:
             raise ValueError("Unnormalized target probabilities require a denominator")
         denominator = dense_p if dense_p is not None else q_values
-    assert t == 16 and q_ids.shape == q_values.shape == (bs, 15, 16)
+    assert t >= 2 and q_ids.shape == q_values.shape == (bs, t - 1, 16)
     _accept_sparse[bs,](
         candidates,
         dense_p if dense_p is not None else q_values,
@@ -527,6 +528,7 @@ def accept_sparse(
         denominator,
         *outputs,
         T=t,
+        T_PAD=triton.next_power_of_2(t),
         V=vocab,
         CAP=capacity,
         K=16,

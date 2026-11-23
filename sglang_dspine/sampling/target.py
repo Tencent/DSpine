@@ -50,7 +50,7 @@ class TargetDistribution:
             )
         # Other block layouts retain the worker's generic rejection path.
         width = int(self.worker.block_size)
-        if width != 16 or sampler.k != 16:
+        if width < 2 or sampler.k != 16:
             return None
         if candidates.shape != (bs, width):
             raise ValueError("Proposal storage does not match this decode batch")

@@ -24,12 +24,13 @@ def _sample_capped_chain(
     Output,
     NewSeq,
     T: tl.constexpr,
+    T_PAD: tl.constexpr,
     V: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
     """One request per program; classical token-wise speculative rejection.
 
-    The dense target/draft envelopes are full16/full15.  Only the verified
+    The dense target/draft envelopes have width T and T-1.  Only the verified
     prefix is dereferenced.  This follows upstream's classic rejection kernel
     and changes its terminal condition from the static width to VerifyLens[b].
     """
@@ -91,10 +92,10 @@ def _sample_capped_chain(
     tl.store(Accept + b, accepted)
     tl.store(Commit + b, accepted + 1)
     tl.store(Bonus + b, bonus)
-    i = tl.arange(0, T)
+    i = tl.arange(0, T_PAD)
     proposed = tl.load(Candidates + b * T + i + 1, i < T - 1, 0)
     emitted = tl.where(i < accepted, proposed, tl.where(i == accepted, bonus, 0))
-    tl.store(Output + b * T + i, emitted)
+    tl.store(Output + b * T + i, emitted, i < T)
     tl.store(NewSeq + b, tl.load(Prefix + b) + accepted + 1)
 
 
@@ -112,10 +113,14 @@ def sample_capped_chain_from_probs(
     """Launch with explicit coins, shared by the runtime and numerical tests."""
     (bs, width) = candidates.shape
     vocab = target_probs.shape[-1]
-    if width != 16 or target_probs.shape != (bs, width, vocab):
-        raise ValueError("Sampled ragged adapter requires target [B,16,V]")
+    if width < 2 or target_probs.shape != (bs, width, vocab):
+        raise ValueError(
+            f"Sampled ragged adapter requires target [B,{width},V] with width >= 2"
+        )
     if draft_probs.shape != (bs, width - 1, vocab):
-        raise ValueError("Sampled ragged adapter requires draft q [B,15,V]")
+        raise ValueError(
+            f"Sampled ragged adapter requires draft q [B,{width - 1},V]"
+        )
     if verify_lens.shape != (bs,) or uniforms.shape != (bs, width - 1):
         raise ValueError("Invalid cap or uniform layout")
     if uniform_final.shape != (bs,) or prefix_lens.shape != (bs,):
@@ -146,6 +151,7 @@ def sample_capped_chain_from_probs(
         prefix_lens,
         *outputs,
         T=width,
+        T_PAD=triton.next_power_of_2(width),
         V=vocab,
         BLOCK_V=4096,
         num_warps=4,
@@ -189,10 +195,10 @@ def accept_sampled_prefix(
     if not sampler.round_sampled or sampler.round_bs != bs:
         raise RuntimeError("Sampled caps require the current sampled proposal and q")
     width = int(worker.block_size)
-    if width != 16 or candidates.shape != (bs, width):
-        raise ValueError("Sampled caps require full16 proposal storage")
+    if width < 2 or candidates.shape != (bs, width):
+        raise ValueError("Sampled caps require full proposal storage with block size >= 2")
     if next_token_logits.shape[0] != bs * width:
-        raise ValueError("Target output must retain the full16 mapped row envelope")
+        raise ValueError("Target output must retain the full mapped row envelope")
     target_probs = build_dspine_target_probs(
         next_token_logits=next_token_logits,
         sampling_info=sampling_info,

@@ -40,7 +40,8 @@ def runner(name, backend=None, **overrides):
 
 @pytest.mark.parametrize("name", ["fa3", "fa4", "triton"])
 def test_supported_backend_preserves_swa_contract(name):
-    validate_native_swa_runner(runner(name), served_block_size=16)
+    for served in (2, 6, 8, 12, 16):
+        validate_native_swa_runner(runner(name), served_block_size=served)
     with pytest.raises(ValueError, match="window_left"):
         validate_native_swa_runner(
             runner(name, sliding_window_size=-1), served_block_size=16
@@ -49,8 +50,9 @@ def test_supported_backend_preserves_swa_contract(name):
         validate_native_swa_runner(
             runner(name, is_hybrid_swa=True), served_block_size=16
         )
-    with pytest.raises(ValueError, match="block size16"):
-        validate_native_swa_runner(runner(name), served_block_size=8)
+    for bad in (0, 1, 17, True, "8"):
+        with pytest.raises(ValueError, match="block sizes 2..16"):
+            validate_native_swa_runner(runner(name), served_block_size=bad)
 
 
 @pytest.mark.parametrize("name", [None, "flashinfer"])

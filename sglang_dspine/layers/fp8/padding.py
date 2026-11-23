@@ -6,18 +6,30 @@ import triton.language as tl
 
 @triton.jit
 def _mask(
-    Rows, ActualBS, Effective, M: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr
+    Rows,
+    ActualBS,
+    Effective,
+    M: tl.constexpr,
+    H: tl.constexpr,
+    GAMMA: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    real = offsets // H < tl.load(ActualBS) * 15
+    real = offsets // H < tl.load(ActualBS) * GAMMA
     value = tl.load(Rows + offsets, (offsets < M * H) & real, 0.0)
     tl.store(Effective + offsets, value, offsets < M * H)
 
 
-def mask(rows, actual_bs, out):
+def mask(rows, actual_bs, out, gamma=15):
     (m, h) = rows.shape
-    assert rows.is_contiguous() and out.shape == rows.shape and out.is_contiguous()
+    gamma = int(gamma)
+    assert (
+        gamma >= 1
+        and rows.is_contiguous()
+        and out.shape == rows.shape
+        and out.is_contiguous()
+    )
     _mask[triton.cdiv(m * h, 512),](
-        rows, actual_bs, out, M=m, H=h, BLOCK=512, num_warps=4
+        rows, actual_bs, out, M=m, H=h, GAMMA=gamma, BLOCK=512, num_warps=4
     )
     return out

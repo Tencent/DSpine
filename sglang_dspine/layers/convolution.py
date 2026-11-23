@@ -78,9 +78,14 @@ def _packed_conv(
 def packed_conv(
     x, indptr, state, weight, bias, activation, slots, scratch_slots, windows, steps=16
 ):
-    if steps != 16 or weight.shape != (x.shape[-1], 4) or state.shape[-1] != 3:
+    if (
+        type(steps) is not int
+        or not 1 <= steps <= windows.shape[1]
+        or weight.shape != (x.shape[-1], 4)
+        or state.shape[-1] != 3
+    ):
         raise ValueError(
-            "Packed convolution supports Qwen GDN width4, state3 and draft16"
+            "Packed convolution supports Qwen GDN width4, state3 and draft steps fitting the scratch window"
         )
     if activation not in (None, False, True, "silu", "swish"):
         raise ValueError(f"Unsupported convolution activation {activation}")
