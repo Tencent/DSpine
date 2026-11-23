@@ -178,11 +178,11 @@ def group_prefixes(prefixes):
     return groups
 
 
-def select_policy(measurements, min_gain=0.03):
+def select_policy(measurements, min_gain=0.03, block=16):
     budgets = {}
     for bs in sorted({row["batch_size"] for row in measurements}):
         rows = [row for row in measurements if row["batch_size"] == bs]
-        decision = prefer_budget(rows, bs * 16, min_gain)
+        decision = prefer_budget(rows, bs * block, min_gain)
         if decision["reason"] != "insufficient_baseline":
             budgets[bs] = decision["selected_budget"]
     return SpsPolicy(token_budgets=budgets)
@@ -199,6 +199,14 @@ def native_token_grid(info):
     ):
         return []
     return sorted({bs * block for bs in (decode.get("bs") or []) if type(bs) is int and bs > 0})
+
+
+def default_widths(block):
+    """Default candidate verification widths for a served draft block size."""
+    narrow = [w for w in (4, 8, 12, 16) if w < block]
+    if not narrow:
+        narrow = [max(1, block // 2)]
+    return sorted({*narrow, block})
 
 
 def candidate_budgets(batch_sizes, width, token_grid, block=16):
@@ -527,8 +535,9 @@ def run_profile_trials(command, document, prefixes, bs, repeat, count, maximum, 
     mode = prefix_mode(prefixes[0])
     with server(command, profile, folder, port, startup_timeout) as url:
         info = request(url + "/server_info", timeout=60)
-        if info.get("speculative_algorithm") != "DSPINE" or info.get("speculative_num_draft_tokens") != 16:
-            raise ValueError("Expected the native DSPINE block16 service")
+        served_block = info.get("speculative_num_draft_tokens")
+        if info.get("speculative_algorithm") != "DSPINE" or type(served_block) is not int or not 2 <= served_block <= 16:
+            raise ValueError("Expected a native DSPINE service with draft block size 2..16")
         limits = [x.get("effective_max_running_requests_per_dp") for x in info.get("internal_states", [])]
         if limits and any(type(x) is not int or x < bs for x in limits):
             raise ValueError("Native request capacity is below the requested actual batch")
@@ -563,7 +572,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--confidence-calibration", type=Path)
     parser.add_argument("--batch-sizes", type=int, nargs="+", required=True)
-    parser.add_argument("--widths", type=int, nargs="+", default=[4, 8, 12, 16])
+    parser.add_argument("--widths", type=int, nargs="+", default=None)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--min-seconds", type=float, default=30)
@@ -581,9 +590,28 @@ def main():
             raise ValueError("Supply a deployment command with --speculative-algorithm DSPINE")
         if any(a.split("=", 1)[0] in ("--host", "--port", "--speculative-dspark-sps-table-path") for a in command):
             raise ValueError("The tuner supplies host, port and SPS-table options")
-        args.batch_sizes, args.widths = sorted(set(args.batch_sizes)), sorted(set(args.widths))
-        if not args.batch_sizes or min(args.batch_sizes) < 1 or not set(args.widths) <= set(range(1,17)) or 16 not in args.widths:
-            raise ValueError("Use positive batch sizes and candidate widths1–16 including16")
+        draft_tokens = option_value(command, "--speculative-num-draft-tokens")
+        dflash_block = option_value(command, "--speculative-dflash-block-size")
+        if (
+            draft_tokens is not None
+            and dflash_block is not None
+            and int(draft_tokens) != int(dflash_block)
+        ):
+            raise ValueError(
+                "--speculative-num-draft-tokens and --speculative-dflash-block-size must match"
+            )
+        block_value = draft_tokens if draft_tokens is not None else dflash_block
+        block = 16 if block_value is None else int(block_value)
+        if not 2 <= block <= 16:
+            raise ValueError("Use --speculative-num-draft-tokens in 2..16")
+        args.batch_sizes = sorted(set(args.batch_sizes))
+        args.widths = (
+            default_widths(block)
+            if args.widths is None
+            else sorted(set(args.widths))
+        )
+        if not args.batch_sizes or min(args.batch_sizes) < 1 or not set(args.widths) <= set(range(1, block + 1)) or block not in args.widths:
+            raise ValueError(f"Use positive batch sizes and candidate widths 1–{block} including {block}")
         if args.repeats < 2 or min(args.max_new_tokens, args.min_requests) < 1:
             raise ValueError("Use at least two repeats and positive request/token limits")
         if any(not math.isfinite(x) or x <= 0 for x in (args.min_seconds,args.startup_timeout,args.min_gain)) or args.min_gain >= 1:
@@ -599,7 +627,8 @@ def main():
     tp_value = option_value(command, ("--tp-size", "--tp", "--tensor-parallel-size"))
     tp_size = 1 if tp_value is None else int(tp_value)
     execution = execution_identity(tp_size, tp_size, option_value(command, "--attention-backend"),
-                                   option_value(command, "--speculative-draft-attention-backend"))
+                                   option_value(command, "--speculative-draft-attention-backend"),
+                                   block_size=block)
     base = {"format":"dspine-sps-v2", "hardware":hardware, "execution":execution,
             "policy":SpsPolicy().to_dict(), "mode_policies":{}}
     if args.baseline_profile:
@@ -610,7 +639,7 @@ def main():
             base["confidence_calibration"] = old["confidence_calibration"]
     if args.confidence_calibration:
         calibration = json.loads(args.confidence_calibration.read_text())
-        load_calibration_tables(calibration)
+        load_calibration_tables(calibration, gamma=block - 1)
         base["confidence_calibration"] = calibration
     output = args.output.resolve()
     folder = output.with_name(output.stem + ".runs")
@@ -624,17 +653,26 @@ def main():
     save_json(probe, base)
     with server(command, probe, folder / "probe", args.port, args.startup_timeout) as url:
         info = request(url + "/server_info", timeout=60)
+        served_block = info.get("speculative_num_draft_tokens", block)
+        if type(served_block) is not int or served_block != block:
+            raise ValueError(f"Expected draft block size {block}, got {served_block!r}")
         base["execution"] = execution_identity(
             info.get("tp_size", tp_size), info.get("tp_size", tp_size),
             info.get("attention_backend"), info.get("speculative_draft_attention_backend"),
+            block_size=block,
         )
+        args.block_size = block
         args.token_grid = native_token_grid(info)
         save_json(folder / "server_info.json", credentials.redact(info))
     def trial(document, rows, bs, repeat, count, destination):
         return run_profile_trials(command, document, rows, bs, repeat, count, args.max_new_tokens,
                                   destination, args.port, args.startup_timeout, args.request_timeout)
     try:
-        selected, report = run_search(args, base, tune, holdout, folder, trial, candidate_budgets, save_json)
+        selected, report = run_search(
+            args, base, tune, holdout, folder, trial,
+            lambda sizes, width, grid: candidate_budgets(sizes, width, grid, block=block),
+            save_json,
+        )
     except Exception as error:
         save_json(folder / "ERROR.json", {"status":"FAIL", "error":credentials.redact_text(repr(error))})
         raise

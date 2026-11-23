@@ -34,18 +34,26 @@ def load_calibration_models(artifact, gamma=15):
                 "calibration with pre_token_max_probability_actual_sampled_chain"
             )
     bins = artifact.get("lookup_bins")
-    if artifact.get("gamma") != gamma or type(bins) is not int or bins < 2:
+    art_gamma = artifact.get("gamma")
+    if (
+        type(art_gamma) is not int
+        or type(gamma) is not int
+        or gamma < 1
+        or art_gamma < gamma
+        or type(bins) is not int
+        or bins < 2
+    ):
         raise ValueError("calibration gamma or lookup_bins differs from the serving block")
     if artifact.get("lookup_grid", "linear") not in ("linear", "logit"):
         raise ValueError("lookup_grid must be linear or logit")
     models = {}
     for mode in ("greedy", "sampled"):
         calibrator = ConfidenceCalibrator.from_artifact(artifact, mode, bins)
-        if calibrator.kind != "table" or calibrator.probabilities.shape != (gamma, bins):
+        if calibrator.kind != "table" or calibrator.probabilities.shape != (art_gamma, bins):
             raise ValueError("calibration needs a [gamma, lookup_bins] table for each mode")
         if artifact.get("lookup_grid") == "logit" and calibrator.boundaries.numel() != bins - 1:
             raise ValueError("logit lookup needs its nonuniform boundaries")
-        models[mode] = calibrator
+        models[mode] = calibrator.slice_prefix(gamma)
     return models
 
 
@@ -139,6 +147,24 @@ class ConfidenceCalibrator(torch.nn.Module):
         log_p = torch.log(raw.clamp_min(self.eps)).clamp_max(upper)
         log_not_p = torch.log((1 - raw).clamp_min(self.eps)).clamp_max(upper)
         return torch.sigmoid((log_p - log_not_p) * self.scale + self.offset)
+
+    def slice_prefix(self, gamma):
+        """Return a calibrator restricted to the first ``gamma`` causal draft depths."""
+        if type(gamma) is not int or not 1 <= gamma <= self.gamma:
+            raise ValueError("calibration prefix gamma out of range")
+        if gamma == self.gamma:
+            return self
+        sliced = ConfidenceCalibrator.__new__(ConfidenceCalibrator)
+        torch.nn.Module.__init__(sliced)
+        sliced.kind = self.kind
+        sliced.gamma = gamma
+        sliced.eps = self.eps
+        sliced.register_buffer("scale", self.scale[:gamma].clone())
+        sliced.register_buffer("offset", self.offset[:gamma].clone())
+        sliced.register_buffer("depth", torch.arange(gamma, device=self.depth.device))
+        sliced.register_buffer("probabilities", self.probabilities[:gamma].clone())
+        sliced.register_buffer("boundaries", self.boundaries.clone())
+        return sliced
 
     def prefix_survival(self, raw):
         """P(accepted >= k), k=1..gamma, with the anchor excluded."""

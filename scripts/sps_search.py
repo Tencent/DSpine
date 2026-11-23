@@ -59,9 +59,9 @@ def split_tasks(prefixes, holdout=None):
         "tune_rows": len(tune), "holdout_rows": len(holdout)}
 
 
-def replace_budget(document, mode, bs, budget):
+def replace_budget(document, mode, bs, budget, block=16):
     """Change one mode/actual-B entry while preserving the complete baseline."""
-    if type(bs) is not int or type(budget) is not int or not bs <= budget <= bs * 16:
+    if type(bs) is not int or type(budget) is not int or not bs <= budget <= bs * block:
         raise ValueError("Invalid batch or token budget")
     result = copy.deepcopy(document)
     policies = result.setdefault("mode_policies", {})
@@ -71,9 +71,14 @@ def replace_budget(document, mode, bs, budget):
     return result
 
 
-def current_budget(document, mode, bs):
+def current_budget(document, mode, bs, block=16):
     policy = document.get("mode_policies", {}).get(mode, document["policy"])
-    return policy.get("token_budgets", {}).get(str(bs), bs * policy.get("verify_widths", {}).get(str(bs), 16))
+    return min(
+        bs * block,
+        policy.get("token_budgets", {}).get(
+            str(bs), bs * policy.get("verify_widths", {}).get(str(bs), block)
+        ),
+    )
 
 
 def aggregate(rounds, *, min_seconds=0, min_requests=1):
@@ -183,29 +188,30 @@ def run_search(args, baseline, tune, holdout, folder, run_trial, candidate_budge
             count = max(count * 2, math.ceil(count * args.min_seconds / max(shortest, 0.001) * 1.1))
         return latest
 
+    block = getattr(args, "block_size", 16)
     for mode in ("greedy", "sampled"):
         rows = [r for r in tune if r["_mode"] == mode]
         if not rows:
             continue
         for bs in sorted(set(args.batch_sizes)):
-            old = current_budget(selected, mode, bs)
-            budgets = sorted(set([old, bs * 16, *(candidate_budgets([bs], width, args.token_grid)[bs]
+            old = current_budget(selected, mode, bs, block=block)
+            budgets = sorted(set([old, bs * block, *(candidate_budgets([bs], width, args.token_grid)[bs]
                                                    for width in args.widths)]))
             available[mode, bs] = budgets
-            documents = {budget: replace_budget(selected, mode, bs, budget) for budget in budgets}
+            documents = {budget: replace_budget(selected, mode, bs, budget, block=block) for budget in budgets}
             result = matrix(documents, rows, bs, folder / "tune" / mode / f"b{bs}")
             decision = prefer_budget(list(result.values()), old, args.min_gain)
             decision.update(mode=mode, batch_size=bs, baseline_budget=old)
             decisions.append(decision)
             records.append({"phase": "tune", "mode": mode, "batch_size": bs,
                             "baseline_budget": old, "measurements": result})
-            selected = replace_budget(selected, mode, bs, decision["selected_budget"])
+            selected = replace_budget(selected, mode, bs, decision["selected_budget"], block=block)
             save(folder / "CANDIDATE.json", selected)
             save(folder / "PROGRESS.json", {"status": "TUNING", "decisions": decisions})
 
     neighbor_plan = []
     for (mode, bs), budgets in available.items():
-        chosen = current_budget(selected, mode, bs)
+        chosen = current_budget(selected, mode, bs, block=block)
         lower = [b for b in budgets if b < chosen]
         higher = [b for b in budgets if b > chosen]
         adjacent = ([max(lower)] if lower else []) + ([min(higher)] if higher else [])
@@ -214,7 +220,7 @@ def run_search(args, baseline, tune, holdout, folder, run_trial, candidate_budge
                               "batch_size": bs, "neighbor_budget": b} for b in adjacent)
     planned_gates.extend({"phase": "holdout-table", "mode": mode, "batch_size": bs}
                          for mode, bs in available)
-    changed = any(current_budget(selected, mode, bs) != current_budget(baseline, mode, bs)
+    changed = any(current_budget(selected, mode, bs, block=block) != current_budget(baseline, mode, bs, block=block)
                   for mode, bs in available)
     if not changed:
         return finish(False, "no_policy_change")
@@ -224,13 +230,13 @@ def run_search(args, baseline, tune, holdout, folder, run_trial, candidate_budge
     gates = []
     for mode, bs, chosen, adjacent in neighbor_plan:
         rows = [r for r in holdout if r["_mode"] == mode]
-        documents = {b: replace_budget(selected, mode, bs, b) for b in [chosen, *adjacent]}
+        documents = {b: replace_budget(selected, mode, bs, b, block=block) for b in [chosen, *adjacent]}
         result = matrix(documents, rows, bs, folder / "holdout-neighbors" / mode / f"b{bs}")
         reference = result[chosen]
         for budget in adjacent:
             comparison = paired_decision(reference, result[budget], args.min_gain)
             # A new narrow entry needs a material held-out win over its wider neighbor.
-            narrowed = chosen < budget and chosen != current_budget(baseline, mode, bs)
+            narrowed = chosen < budget and chosen != current_budget(baseline, mode, bs, block=block)
             clear_narrow_gain = paired_decision(result[budget], reference, args.min_gain)["accepted"]
             passed = comparison["adequate"] and not comparison["accepted"] and (not narrowed or clear_narrow_gain)
             gates.append(passed)

@@ -105,6 +105,7 @@ class VerifyCaps:
                 size,
                 get_exec().kernel.attention_backend,
                 worker.draft_model_runner.draft_attention_backend,
+                block_size=self.full if self.full != 16 else None,
             )
         self.default_policy, self.mode_policies = SpsPolicy.load_with_modes(
             get_spec().speculative_dspark_sps_table_path,
@@ -116,7 +117,7 @@ class VerifyCaps:
             {
                 self.full,
                 *(
-                    width
+                    min(width, self.full)
                     for mode in ("greedy", "sampled")
                     for width in self.policy_for_mode(mode).verify_widths.values()
                 ),
