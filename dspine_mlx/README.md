@@ -70,6 +70,43 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 trained block size). The SGLang plugin supports full-attention Qwen3 targets only; overlap
 scheduling, CUDA graphs and the radix cache are disabled.
 
+### Multi-turn chat and agents: prompt cache
+
+A chat or agent client sends the whole conversation every turn. With the
+prompt cache on, the target keeps its cache between `generate` calls and reads
+only the part of the next prompt that is new:
+
+```python
+target.enable_prompt_cache(True, ctx_rows=draft.config.sliding_window)
+gen = DSpineGenerator(target, draft)
+tokens, stats = gen.generate(turn_1)                    # full prefill
+tokens, stats = gen.generate(turn_1 + tokens + turn_2)  # prefills turn_2 only
+print(target.last_reused)                               # prompt tokens taken from the cache
+```
+
+- If the new prompt continues the previous prompt and its answer, everything
+  the cache holds is reused.
+- If the answer was changed in the history (for example its thinking was
+  stripped), the cache goes back to the end of the previous prompt, from a
+  snapshot (a GatedDeltaNet state cannot be rewound, so that point is saved).
+- If a new conversation starts with the same long system prompt, the cache
+  goes back to a restore point at the end of that shared start (saved the
+  second time two prompts share it, or at once when you set
+  `target.mark_hint` to its length before `generate`).
+- Otherwise the prompt is read from the start, as before.
+
+The output does not change: the reused cache holds the states a full prefill
+of the same tokens leaves (`tests/mlx/test_prompt_cache.py`). It is off by
+default, works for pure-attention and hybrid targets, and costs the kept
+hidden rows of the draft's context (`ctx_rows`; all rows for a draft without
+a sliding window). Try it with `--chat`:
+
+```bash
+dspine-generate --target <target> --draft <draft> --chat
+```
+
+Each turn prints `prompt=... reused=... prefill=...s`.
+
 ## Qwen3.8-27B (hybrid target)
 
 [tencent/Qwen3.8-27B-DSpine-b16](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16)

@@ -163,6 +163,9 @@ class TargetAdapter:
         # One entry per cache slot: a recording GatedDeltaNet or None ([] if pure attention).
         self._linear = install_recording(self.layers)
         self._verify_steps = 0
+        self.prompt_cache = False
+        self._ctx_rows = None
+        self._drop_session()
 
     @classmethod
     def load(cls, path: str | Path, target_layer_ids) -> "TargetAdapter":
@@ -170,10 +173,142 @@ class TargetAdapter:
         return cls(model, tokenizer, target_layer_ids)
 
     def reset(self) -> None:
+        if self.prompt_cache and self.cache is not None and self._seq is not None:
+            return  # the next prefill decides what to reuse
         self._storage = [None] * len(self.target_layer_ids)
         for hook in (self.layers[lid] for lid in self.target_layer_ids):
             hook._storage = self._storage
         self.cache = make_prompt_cache(self.model)
+        self._drop_session()
+
+    # ---- prompt cache across turns ------------------------------------------
+    #
+    # With the prompt cache on, ``reset()`` keeps the target cache and
+    # ``prefill(prompt)`` reuses the longest part of it that ``prompt`` starts
+    # with:
+    #   * everything the cache holds (the previous prompt and the answer
+    #     committed after it), when the new prompt continues it, as in a chat
+    #     or agent loop that sends the whole history each turn;
+    #   * otherwise the previous prompt, from a snapshot taken at the end of
+    #     its prefill (a GatedDeltaNet state cannot be rewound, so the restore
+    #     point is saved); this covers a history whose last answer was edited
+    #     or had its thinking stripped;
+    #   * otherwise a mark: a restore point inside an earlier prompt. One is
+    #     saved where a prompt stopped matching the one before it (the end of
+    #     a shared system prompt), and one where the caller says a stable
+    #     prefix ends (``mark_hint``), so a new conversation with the same long
+    #     system prompt reads only what follows it;
+    #   * otherwise nothing: a full prefill.
+    # The tokens a reused cache gives are the ones a full prefill gives: the
+    # cache holds exactly the states a full prefill of the same tokens leaves.
+    # The draft gets the hidden rows of the reused part too (``ctx_rows`` of
+    # them: the draft's sliding window, or all of them without a window), so a
+    # fresh draft cache sees the context it sees after a full prefill.
+
+    mark_min = 256  # shortest shared prefix worth a mark, in tokens
+    mark_max = 3  # marks kept (each holds the GatedDeltaNet states and draft rows)
+    mark_hint = None  # set before prefill: a prefix length to mark in this prompt
+
+    def enable_prompt_cache(self, on: bool = True, ctx_rows: int | None = None) -> None:
+        """Keep the cache between ``generate`` calls. ``ctx_rows``: hidden rows
+        kept for the draft (its sliding window; None keeps all of them)."""
+        self.prompt_cache = bool(on)
+        self._ctx_rows = None if ctx_rows is None else int(ctx_rows)
+        self._drop_session()
+
+    def _drop_session(self) -> None:
+        self._seq = None       # token ids the cache holds, committed
+        self._hid = []         # hidden chunks of the committed positions
+        self._pending = None   # (token ids, hidden) of a verify not yet trimmed
+        self._snap = None      # (n_tokens, layer states, hidden rows, logits) after the last prefill
+        self._marks = []       # (n_tokens, layer states, hidden rows, None) inside earlier prompts
+        self._shared = 0       # tokens the last prompt shared with the cache before it
+        self._ahead = False    # the cache holds tokens the next prompt may not have
+        self.last_reused = 0   # prompt tokens the last prefill took from the cache
+
+    def _hid_rows(self):
+        if not self._hid:
+            return None
+        h = self._hid[0] if len(self._hid) == 1 else mx.concatenate(self._hid, axis=1)
+        if self._ctx_rows is not None:
+            h = h[:, -self._ctx_rows :]
+        self._hid = [h]
+        return h
+
+    def _commit(self, ids: list, hidden) -> None:
+        self._seq.extend(ids)
+        if hidden is not None:
+            self._hid.append(hidden)
+            if len(self._hid) > 64:
+                self._hid_rows()
+
+    def _slots(self):
+        """(cache entry, recording GatedDeltaNet or None) per layer."""
+        return zip(self.cache, self._linear or [None] * len(self.cache))
+
+    def _layer_state(self) -> list:
+        return [int(c.offset) if mod is None else (c[0], c[1]) for c, mod in self._slots()]
+
+    def _restore(self, snap) -> None:
+        n, states, hid, _ = snap
+        for (c, mod), st in zip(self._slots(), states):
+            if mod is None:
+                c.trim(int(c.offset) - st)
+            else:
+                c[0], c[1] = st
+                mod._box.record = None
+        self._seq = self._seq[:n]
+        self._marks = [m for m in self._marks if m[0] <= n]
+        self._hid = [hid] if hid is not None else []
+        self._pending = None
+        self._verify_steps = 0
+
+    def _resume(self, ids: list) -> int:
+        """Bring the cache to a prefix of ``ids``; returns its length (0: start over)."""
+        self._shared = 0
+        if self.cache is None or self._seq is None:
+            return 0
+        if self._pending is not None:
+            # The last verify of a generation is not trimmed: keep the part of
+            # it that the new prompt repeats.
+            toks = [int(t) for t in self._pending[0].tolist()]
+            base, m = len(self._seq), 0
+            while m < len(toks) and base + m < len(ids) and ids[base + m] == toks[m]:
+                m += 1
+            if m == 0:
+                self._ahead, self._pending = True, None
+            else:
+                self.trim(len(toks) - m)
+        seq = self._seq
+        c, lim = 0, min(len(seq), len(ids))
+        while c < lim and seq[c] == ids[c]:
+            c += 1
+        self._shared = c
+        if c == len(seq) and c < len(ids) and not self._ahead:
+            return c
+        best = None
+        for snap in [self._snap] + self._marks:
+            # a mark has no logits, so it cannot stand for the whole prompt
+            if snap is None or snap[0] > c or (snap[3] is None and snap[0] >= len(ids)):
+                continue
+            if best is None or snap[0] > best[0]:
+                best = snap
+        if best is not None:
+            self._restore(best)
+            self._ahead = False
+            return best[0]
+        return 0
+
+    def _mark_points(self, start: int, n: int) -> list:
+        """Where to save marks while prefilling positions start..n."""
+        hint = int(self.mark_hint or 0)
+        pts = {m[0] for m in self._marks}
+        if self._shared >= self.mark_min:
+            pts.add(self._shared)
+        if hint >= self.mark_min:
+            pts.add(hint)
+        top = max(self._shared, hint)
+        return sorted(p for p in pts if start < p < n and p <= top)
 
     def _forward(self, tokens: mx.array, capture: bool = True):
         self._storage = [None] * len(self.target_layer_ids)
@@ -194,20 +329,61 @@ class TargetAdapter:
         (about 16 GB for 32k tokens and a 248k vocabulary). Chunks whose
         logits are never evaluated skip the LM head. Hidden features are kept
         for every position, since the draft needs them.
+
+        With the prompt cache on, only the part of ``tokens`` that the cache
+        does not hold yet is fed (see ``enable_prompt_cache``).
         """
-        self.cache = make_prompt_cache(self.model)
+        session = self.prompt_cache and capture
+        start, points = 0, []
+        if session:
+            ids = [int(t) for t in tokens[0].tolist()]
+            start = self._resume(ids)
+            self.last_reused = start
+            if start == len(ids):  # the same prompt again: the snapshot has its logits
+                self.mark_hint = None
+                return self._snap[3], self._snap[2]
+            points = self._mark_points(start, len(ids))
+            self.mark_hint = None
+        if start == 0:
+            self.cache = make_prompt_cache(self.model)
+            self._drop_session()
+            if session:
+                self._seq = []
         n = int(tokens.shape[1])
         hs = []
+        if start:
+            prev = self._hid_rows()
+            if prev is not None:
+                hs.append(prev)
         logits = hidden = None
-        for s in range(0, n, PREFILL_CHUNK):
-            logits, hidden = self._forward(tokens[:, s : s + PREFILL_CHUNK], capture=capture)
-            if capture:
-                hs.append(hidden)
-            if s + PREFILL_CHUNK < n:
-                mx.eval([c.state for c in self.cache] + hs[-1:])
+        pos = start
+        for end in points + [n]:
+            first = len(hs)
+            for s in range(pos, end, PREFILL_CHUNK):
+                e = min(s + PREFILL_CHUNK, end)
+                logits, hidden = self._forward(tokens[:, s:e], capture=capture)
+                if capture:
+                    hs.append(hidden)
+                if e < n:
+                    mx.eval([c.state for c in self.cache] + hs[-1:])
+            if session:
+                new = hs[first:]
+                self._commit(ids[pos:end], new[0] if len(new) == 1 else mx.concatenate(new, axis=1))
+                if end < n:  # a mark
+                    rows = self._hid_rows()
+                    mx.eval(rows, [c.state for c in self.cache])
+                    self._marks.append((end, self._layer_state(), rows, None))
+            pos = end
         if capture and len(hs) > 1:
             hidden = mx.concatenate(hs, axis=1)
-        return logits[:, -1:], hidden
+        logits = logits[:, -1:]
+        if session:
+            self._marks = self._marks[-self.mark_max :]
+            rows = self._hid_rows()
+            mx.eval(logits, rows, [c.state for c in self.cache])
+            self._snap = (len(ids), self._layer_state(), rows, logits)
+            self._ahead = False
+        return logits, hidden
 
     def _set_recording(self, on: bool) -> None:
         for mod in self._linear:
@@ -216,16 +392,20 @@ class TargetAdapter:
 
     def verify(self, tokens: mx.array, capture: bool = True):
         if not self._linear:
-            return self._forward(tokens, capture=capture)
-        self._set_recording(True)
-        try:
             out = self._forward(tokens, capture=capture)
-        finally:
-            self._set_recording(False)
-        self._verify_steps = int(tokens.shape[1])
+        else:
+            self._set_recording(True)
+            try:
+                out = self._forward(tokens, capture=capture)
+            finally:
+                self._set_recording(False)
+            self._verify_steps = int(tokens.shape[1])
+        if self._seq is not None:
+            self._pending = (tokens[0], out[1])
         return out
 
     def step(self, token: int) -> mx.array:
+        self._seq = None  # plain decoding bypasses the prompt-cache bookkeeping
         logits, _ = self._forward(
             mx.array([[int(token)]], dtype=mx.int32), capture=False
         )
@@ -233,6 +413,14 @@ class TargetAdapter:
 
     def trim(self, n: int) -> None:
         """Drop the last ``n`` tokens of the preceding verify pass."""
+        if self._pending is not None:
+            toks, hidden = self._pending
+            keep = int(toks.shape[0]) - max(int(n), 0)
+            self._pending = None
+            self._commit(
+                [int(t) for t in toks[:keep].tolist()],
+                None if hidden is None else hidden[:, :keep],
+            )
         if self._linear:
             return self._trim_hybrid(n)
         if n <= 0:

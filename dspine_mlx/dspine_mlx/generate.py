@@ -293,6 +293,46 @@ def _load_tokenizer_eos(tokenizer) -> set[int]:
     return {int(eos_id)} if eos_id is not None else set()
 
 
+def _chat(target: TargetAdapter, draft, tokenizer, args) -> None:
+    """Multi-turn chat. The whole conversation is sent each turn, as a chat or
+    agent client does; with the prompt cache on, the target reads only what is
+    new."""
+    target.enable_prompt_cache(True, ctx_rows=draft.config.sliding_window)
+    gen = DSpineGenerator(target, draft, block_size=args.block_size)
+    stop_ids = _load_tokenizer_eos(tokenizer)
+    messages = []
+    print("[dspine] chat: an empty line or Ctrl-D ends")
+    while True:
+        try:
+            user = input(">>> ").strip()
+        except EOFError:
+            break
+        if not user:
+            break
+        messages.append({"role": "user", "content": user})
+        prompt = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, enable_thinking=False
+        )
+        tokens, stats = gen.generate(
+            prompt,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            min_p=args.min_p,
+            stop_ids=stop_ids,
+        )
+        text = tokenizer.decode([t for t in tokens if t not in stop_ids])
+        print(text)
+        print(
+            f"[dspine] prompt={len(prompt)} reused={target.last_reused} "
+            f"prefill={stats.prefill_seconds:.2f}s tokens={stats.generated_tokens} "
+            f"decode={stats.decode_tps:.2f} tok/s"
+        )
+        messages.append({"role": "assistant", "content": text})
+        mx.clear_cache()
+
+
 def main() -> None:
     p = argparse.ArgumentParser("dspine-generate")
     p.add_argument("--target", required=True)
@@ -312,6 +352,12 @@ def main() -> None:
     p.add_argument("--draft-q-mode", default="affine")
     p.add_argument("--profile", action="store_true")
     p.add_argument("--baseline", action="store_true")
+    p.add_argument(
+        "--chat",
+        action="store_true",
+        help="multi-turn chat on stdin; the target cache is kept between turns, "
+        "so each turn prefills only the new part of the conversation",
+    )
     args = p.parse_args()
 
     mx.random.seed(args.seed)
@@ -327,6 +373,8 @@ def main() -> None:
     draft.bind(target.model)
     tokenizer = target.tokenizer
 
+    if args.chat:
+        return _chat(target, draft, tokenizer, args)
     if args.raw:
         prompt = tokenizer.encode(args.prompt, add_special_tokens=True)
     else:
