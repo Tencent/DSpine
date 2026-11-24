@@ -99,7 +99,8 @@ sglang serve \
 The implementation uses [DSpark](https://github.com/deepseek-ai/DeepSpec)-based
 dynamic verification and [ReplaySSM](https://github.com/Johnny-Liou/ReplaySSM).
 
-The draft model supports FlashAttention 4 (`--speculative-draft-attention-backend fa4`).
+The draft model supports FlashAttention 4 (`--speculative-draft-attention-backend fa4`) and
+served block sizes from `2` to `16` via `--speculative-num-draft-tokens` (default `16`).
 
 Run [SPS tuning](docs/sps_tuning.md) with your serving settings to tune dynamic verification.
 Add `--speculative-dspark-sps-table-path sps.json` to the command below to load the result.

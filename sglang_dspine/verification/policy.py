@@ -63,6 +63,10 @@ class SpsPolicy:
                     raise ValueError(
                         "SPS profile has no TP layout; retune for this deployment"
                     )
+                if execution.get("block_size", 16) != 16:
+                    raise ValueError(
+                        "SPS profile execution layout differs; retune for this deployment"
+                    )
             else:
                 for name in (
                     "tp_size",
@@ -80,6 +84,16 @@ class SpsPolicy:
                             raise ValueError(
                                 "SPS profile execution layout differs; retune for this deployment"
                             )
+                recorded_block = recorded.get("block_size", 16)
+                expected_block = execution.get("block_size", 16)
+                if (
+                    type(recorded_block) is not int
+                    or not 2 <= recorded_block <= 16
+                    or recorded_block != expected_block
+                ):
+                    raise ValueError(
+                        "SPS profile execution layout differs; retune for this deployment"
+                    )
         policy = data["policy"]
         if data["format"] == "dspine-sps-v1":
             widths, budget = policy["uniform_widths"], policy["batch8_tokens"]
@@ -90,13 +104,30 @@ class SpsPolicy:
                 or budget not in range(16, 129, 16)
             ):
                 raise ValueError("Invalid legacy DSpine SPS profile")
-            return cls(dict(enumerate(widths, 1)), {8: budget}), {}
-        modes = data.get("mode_policies", {})
-        if not isinstance(modes, dict) or set(modes) - {"greedy", "sampled"}:
-            raise ValueError("SPS mode_policies only supports greedy and sampled")
-        return cls.from_dict(policy), {
-            mode: cls.from_dict(value) for mode, value in modes.items()
-        }
+            default, mode_policies = cls(dict(enumerate(widths, 1)), {8: budget}), {}
+        else:
+            modes = data.get("mode_policies", {})
+            if not isinstance(modes, dict) or set(modes) - {"greedy", "sampled"}:
+                raise ValueError("SPS mode_policies only supports greedy and sampled")
+            default = cls.from_dict(policy)
+            mode_policies = {
+                mode: cls.from_dict(value) for mode, value in modes.items()
+            }
+        block = (
+            execution.get("block_size", 16)
+            if execution is not None
+            else (data.get("execution") or {}).get("block_size", 16)
+        )
+        if type(block) is not int or not 2 <= block <= 16:
+            raise ValueError("SPS profile block_size must be an integer in 2..16")
+        for item in (default, *mode_policies.values()):
+            if any(w > block for w in item.verify_widths.values()) or any(
+                budget > bs * block for bs, budget in item.token_budgets.items()
+            ):
+                raise ValueError(
+                    f"SPS profile widths/budgets exceed draft block size {block}"
+                )
+        return default, mode_policies
 
     @classmethod
     def from_dict(cls, policy):
@@ -121,11 +152,18 @@ def hardware_identity(device):
 
 
 def execution_identity(
-    tp_size, draft_tp_size, attention_backend=None, draft_attention_backend=None
+    tp_size,
+    draft_tp_size,
+    attention_backend=None,
+    draft_attention_backend=None,
+    block_size=None,
 ):
-    return {
+    identity = {
         "tp_size": int(tp_size),
         "draft_tp_size": int(draft_tp_size),
         "attention_backend": attention_backend,
         "draft_attention_backend": draft_attention_backend,
     }
+    if block_size is not None and int(block_size) != 16:
+        identity["block_size"] = int(block_size)
+    return identity

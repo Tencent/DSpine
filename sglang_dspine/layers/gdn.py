@@ -11,21 +11,26 @@ def _to_dense(
     Y,
     D: tl.constexpr,
     T: tl.constexpr,
+    T_PAD: tl.constexpr,
     S0: tl.constexpr,
     S1: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
     f = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    t = tl.arange(0, T)
+    t = tl.arange(0, T_PAD)
     start = tl.load(Q + req)
     end = tl.load(Q + req + 1)
     value = tl.load(
         X + (start + t[:, None]) * S0 + f[None, :] * S1,
-        (t[:, None] < end - start) & (f[None, :] < D),
+        (t[:, None] < end - start) & (t[:, None] < T) & (f[None, :] < D),
         0,
     )
-    tl.store(Y + (req * T + t[:, None]) * D + f[None, :], value, f[None, :] < D)
+    tl.store(
+        Y + (req * T + t[:, None]) * D + f[None, :],
+        value,
+        (t[:, None] < T) & (f[None, :] < D),
+    )
 
 
 @triton.jit
@@ -55,12 +60,14 @@ def _from_dense(
 
 
 def dense_conv_input(x, indptr, steps):
-    if steps != 16:
-        raise ValueError("Ragged GDN adapter currently requires draft16")
+    if type(steps) is not int or steps < 1:
+        raise ValueError("Ragged GDN adapter requires positive draft steps")
     bs = indptr.numel() - 1
     dim = x.shape[-1]
     dense = x.new_empty((bs * steps, dim))
-    _to_dense[bs, triton.cdiv(dim, 128)](x, indptr, dense, dim, steps, *x.stride(), 128)
+    _to_dense[bs, triton.cdiv(dim, 128)](
+        x, indptr, dense, dim, steps, triton.next_power_of_2(steps), *x.stride(), 128
+    )
     return dense.view(bs, steps, dim).transpose(1, 2)
 
 

@@ -1,7 +1,8 @@
 # SPS tuning
 
 Tune verification budgets for your hardware and workload using the same serving
-settings as deployment, including TP size and attention backends.
+settings as deployment, including TP size, attention backends, and
+`--speculative-num-draft-tokens` (`2..16`, default `16`).
 
 ## 1. Prepare requests
 

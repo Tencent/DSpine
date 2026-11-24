@@ -181,7 +181,7 @@ class DSpineDraftSampler:
             )
             == 248320
             and h == 5120
-            and t == 16
+            and 2 <= t <= 16
             and k == 16
             and r == 512
         )

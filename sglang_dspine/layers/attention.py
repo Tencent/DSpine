@@ -76,8 +76,10 @@ def validate_native_layer_windows(layers, window, *, decoder_type):
 
 def validate_native_swa_runner(runner, *, served_block_size):
     """Fail before graph capture unless the audited native backend is active."""
-    if served_block_size != BLOCK_SIZE:
-        raise ValueError("Qwen3.8-27B DSpine serves its trained block size16")
+    if type(served_block_size) is not int or not 2 <= served_block_size <= BLOCK_SIZE:
+        raise ValueError(
+            f"Qwen3.8-27B DSpine serves block sizes 2..{BLOCK_SIZE}, got {served_block_size!r}"
+        )
     if runner.draft_attention_backend not in BACKENDS:
         raise ValueError(
             "Native DSPINE SWA configuration requires --speculative-draft-attention-backend fa3, fa4, or triton"

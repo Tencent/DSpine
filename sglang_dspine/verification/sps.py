@@ -118,8 +118,11 @@ class RaggedSpsCaps(RaggedVerifyCaps):
             if data.get("format") == FORMAT:
                 calibration = data
         if calibration is None:
+            table = conditional_table(data)
+            if len(table) < self.full - 1:
+                raise ValueError("legacy calibration table shorter than serving gamma")
             legacy = torch.tensor(
-                conditional_table(data), device=worker.device, dtype=torch.float32
+                table[: self.full - 1], device=worker.device, dtype=torch.float32
             )
             self.probabilities = {"greedy": legacy, "sampled": legacy}
             self.boundaries = {"greedy": None, "sampled": None}
@@ -150,7 +153,7 @@ class RaggedSpsCaps(RaggedVerifyCaps):
             worker._dspine_sampler.confidence_out.fill_(1.0)
             for family, probabilities in self.probabilities.items():
                 for bs, budget in self.policy_for_mode(family).token_budgets.items():
-                    if budget == bs * self.full or bs > worker._dspine_sampler.max_bs:
+                    if budget >= bs * self.full or bs > worker._dspine_sampler.max_bs:
                         continue
                     tier = graph_tokens_for_budget(self.ragged_graph, budget, bs)
                     if tier is None:

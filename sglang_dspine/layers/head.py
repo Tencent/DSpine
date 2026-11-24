@@ -15,11 +15,13 @@ class DraftHead:
         self.coarse = FullVFP8Coarse(
             torch, sampler.lm_head_weight, getattr(sampler, "tp_head", None)
         )
+        self.gamma = int(sampler.block_size) - 1
+        self.hidden = int(sampler.raw.shape[1])
         self.actual_bs = torch.full(
             (1,), sampler.max_bs, device=sampler.raw.device, dtype=torch.int32
         )
         self.rows = torch.empty(
-            (sampler.max_bs * 15, 5120),
+            (sampler.max_bs * self.gamma, self.hidden),
             device=sampler.raw.device,
             dtype=torch.bfloat16,
         )
@@ -30,7 +32,9 @@ class DraftHead:
     def retrieve(self, rows):
         from flashinfer.topk import top_k
 
-        rows = padding.mask(rows, self.actual_bs, self.rows[: rows.shape[0]])
+        rows = padding.mask(
+            rows, self.actual_bs, self.rows[: rows.shape[0]], gamma=self.gamma
+        )
         if self.capture_owner is not None:
             return self.coarse.retrieve_and_rescore(
                 rows, fi_top_k=top_k, gather_ops=gather
@@ -71,7 +75,7 @@ def around_capture(original, backend, shape_key, forward_fn, *args, **kwargs):
     try:
         with owner.bind():
             rows = torch.zeros(
-                (int(shape_key.size) * 15, 5120),
+                (int(shape_key.size) * head.gamma, head.hidden),
                 device=sampler.raw.device,
                 dtype=torch.bfloat16,
             )
