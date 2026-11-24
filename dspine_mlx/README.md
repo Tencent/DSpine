@@ -107,6 +107,21 @@ dspine-generate --target <target> --draft <draft> --chat
 
 Each turn prints `prompt=... reused=... prefill=...s`.
 
+### Copy drafts
+
+When an answer repeats text that is already in the context, as when editing
+code, quoting a document or repeating tool output, the draft does not need to
+guess it. With `copy=True` (`--copy` on the command line), a round whose last
+`copy_min` tokens (default 12) also occur earlier in the prompt or the answer
+proposes the tokens that followed them there, and the draft is not run for that
+round. The proposal starts at 4 tokens and doubles up to 15 while the target
+accepts all of it. The target checks a copy like any draft, so the output does
+not change (greedy and sampled).
+
+```python
+gen = DSpineGenerator(target, draft, copy=True)
+```
+
 ## Qwen3.8-27B (hybrid target)
 
 [tencent/Qwen3.8-27B-DSpine-b16](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16)
