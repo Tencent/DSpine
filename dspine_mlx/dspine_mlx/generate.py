@@ -27,6 +27,7 @@ class GenStats:
     verify_seconds: float = 0.0
     peak_memory_gb: float = 0.0
     block_size: int = 0
+    copy_rounds: int = 0
 
     @property
     def decode_tps(self) -> float:
@@ -48,8 +49,50 @@ def _sample_target(logits: mx.array, inv_temp: float, top_k: int, top_p: float, 
     return int(sample_from_probs(probs, u).item())
 
 
+class CopyIndex:
+    """Latest earlier occurrence of every ``n``-token window of a growing token list."""
+
+    def __init__(self, n: int):
+        if n < 1:
+            raise ValueError("copy window must be at least 1 token")
+        self.n = int(n)
+        self.ids: list[int] = []
+        self._ends: dict[tuple, int] = {}
+        self._indexed = self.n - 1  # windows ending before this index are in the map
+
+    def extend(self, tokens) -> None:
+        self.ids.extend(int(t) for t in tokens)
+
+    def lookup(self, max_len: int) -> list[int]:
+        """Tokens that followed the latest earlier occurrence of the last ``n`` tokens."""
+        ids, n = self.ids, self.n
+        last = len(ids) - 1
+        if last < n or max_len < 1:
+            return []
+        for e in range(self._indexed, last):
+            self._ends[tuple(ids[e - n + 1 : e + 1])] = e
+        self._indexed = max(self._indexed, last)
+        j = self._ends.get(tuple(ids[last - n + 1 :]))
+        if j is None:
+            return []
+        return ids[j + 1 : j + 1 + max_len]
+
+
 class DSpineGenerator:
-    def __init__(self, target: TargetAdapter, draft, *, block_size: int | None = None, profile: bool = False):
+    """DSpine speculative decoding.
+
+    copy: when the last ``copy_min`` tokens of the text so far also occur
+    earlier in the prompt or the answer, propose the tokens that followed them
+    there instead of running the draft for that round (editing code, quoting,
+    repeating tool output). The proposal starts at ``copy_start`` tokens and
+    doubles, up to ``copy_max``, while the target accepts all of it. The
+    output does not change: a greedy round commits the target's argmax tokens,
+    and a sampled copy round is rejection sampling against a one-point
+    proposal.
+    """
+
+    def __init__(self, target: TargetAdapter, draft, *, block_size: int | None = None, profile: bool = False,
+                 copy: bool = False, copy_min: int = 12, copy_start: int = 4, copy_max: int = 15):
         if target.vocab_size != draft.vocab_size:
             raise ValueError(
                 f"target vocab {target.vocab_size} != draft vocab {draft.vocab_size}"
@@ -76,6 +119,10 @@ class DSpineGenerator:
         )
         self.tables_seconds = time.perf_counter() - t0
         self.tail = RefinementTail(draft, target.head, self.tg, self.tsv)
+        self.copy = bool(copy)
+        self.copy_min = int(copy_min)
+        self.copy_start = max(1, int(copy_start))
+        self.copy_max = max(self.copy_start, int(copy_max))
 
     def set_block_size(self, block_size: int) -> None:
         self.draft.set_block_size(block_size)
@@ -124,6 +171,14 @@ class DSpineGenerator:
         tokens = [anchor]
         done = anchor in stop or len(tokens) >= max_tokens
 
+        index = None
+        if self.copy:
+            index = CopyIndex(self.copy_min)
+            index.extend(prompt[0].tolist())
+            index.extend(tokens)
+        copy_len, copy_rest = self.copy_start, False
+        pend = [hidden]  # target features the draft has not seen yet
+
         draft_caches = self.draft.make_cache()
         while not done:
             remaining = max_tokens - len(tokens)
@@ -131,42 +186,24 @@ class DSpineGenerator:
             if round_T < 2:
                 break
 
-            block = mx.array(
-                [[anchor] + [self.draft.mask_token_id] * (round_T - 1)],
-                dtype=mx.int32,
-            )
-            t_phase = time.perf_counter()
-            out, stash = self.draft(hidden, block, draft_caches)
-            if self.profile:
-                mx.eval(out)
-                stats.draft_seconds += time.perf_counter() - t_phase
-
-            rows = out[0, 1:]
-            t_phase = time.perf_counter()
-            if greedy:
-                drafts, cand = self.tail.greedy(rows, stash, anchor)
-                q_rows = None
+            copied = []
+            if index is not None and not copy_rest:
+                copied = index.lookup(min(copy_len, self.copy_max, remaining))
+            copy_rest = False
+            if copied:
+                round_T = len(copied) + 1
+                drafts = mx.array(copied, dtype=mx.int32)
+                q_rows = cand = None
+                if not greedy:  # a proposal with all its mass on the copied token
+                    cand = drafts[:, None]
+                    q_rows = mx.ones((len(copied), 1), dtype=mx.float32)
             else:
-                uniforms = mx.random.uniform(shape=(round_T - 1,))
-                drafts, q_rows, cand = self.tail.sampled(
-                    rows,
-                    stash,
-                    anchor,
-                    inv_temp=inv_temp,
-                    top_k=chain_top_k,
-                    top_p=top_p,
-                    min_p=min_p,
-                    uniforms=uniforms,
+                ctx = pend[0] if len(pend) == 1 else mx.concatenate(pend, axis=1)
+                pend = []
+                drafts, q_rows, cand = self._draft_round(
+                    ctx, anchor, round_T, draft_caches, stats, greedy,
+                    inv_temp=inv_temp, top_k=chain_top_k, top_p=top_p, min_p=min_p,
                 )
-            if self.profile:
-                mx.eval(drafts, cand)
-                stats.tail_seconds += time.perf_counter() - t_phase
-            else:
-                # Let the draft/tail run while the verify graph is built.
-                if greedy:
-                    mx.async_eval(drafts)
-                else:
-                    mx.async_eval(drafts, q_rows, cand)
 
             verify_tokens = mx.concatenate(
                 [mx.array([[anchor]], dtype=mx.int32), drafts[None]], axis=1
@@ -195,6 +232,11 @@ class DSpineGenerator:
 
             accept_i = int(accept.item())
             bonus_i = int(bonus.item())
+            if copied:
+                stats.copy_rounds += 1
+                full = accept_i == len(copied)
+                copy_len = min(copy_len * 2, self.copy_max) if full else self.copy_start
+                copy_rest = accept_i == 0  # a copy that missed at once: let the draft take a round
             draft_list = drafts.tolist()
             new_tokens = draft_list[:accept_i] + [bonus_i]
             new_tokens = new_tokens[: max_tokens - len(tokens)]
@@ -211,6 +253,8 @@ class DSpineGenerator:
                 break
 
             tokens.extend(new_tokens)
+            if index is not None:
+                index.extend(new_tokens)
             stats.rounds += 1
             stats.accepted_drafts += min(accept_i, len(new_tokens))
             stats.committed_tokens += len(new_tokens)
@@ -223,13 +267,54 @@ class DSpineGenerator:
                 break
 
             self.target.trim(round_T - accept_i - 1)
-            hidden = vhidden[:, : accept_i + 1, :]
+            pend.append(vhidden[:, : accept_i + 1, :])
             anchor = new_tokens[-1]
 
         stats.generated_tokens = len(tokens)
         stats.decode_seconds = time.perf_counter() - t0
         stats.peak_memory_gb = mx.get_peak_memory() / 1e9
         return tokens, stats
+
+    def _draft_round(self, hidden, anchor, round_T, draft_caches, stats, greedy, *,
+                 inv_temp, top_k, top_p, min_p):
+        """One draft block: returns (drafts, q_rows, cand); q_rows is None when greedy."""
+        block = mx.array(
+            [[anchor] + [self.draft.mask_token_id] * (round_T - 1)],
+            dtype=mx.int32,
+        )
+        t_phase = time.perf_counter()
+        out, stash = self.draft(hidden, block, draft_caches)
+        if self.profile:
+            mx.eval(out)
+            stats.draft_seconds += time.perf_counter() - t_phase
+
+        rows = out[0, 1:]
+        t_phase = time.perf_counter()
+        if greedy:
+            drafts, cand = self.tail.greedy(rows, stash, anchor)
+            q_rows = None
+        else:
+            uniforms = mx.random.uniform(shape=(round_T - 1,))
+            drafts, q_rows, cand = self.tail.sampled(
+                rows,
+                stash,
+                anchor,
+                inv_temp=inv_temp,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                uniforms=uniforms,
+            )
+        if self.profile:
+            mx.eval(drafts, cand)
+            stats.tail_seconds += time.perf_counter() - t_phase
+        else:
+            # Let the draft/tail run while the verify graph is built.
+            if greedy:
+                mx.async_eval(drafts)
+            else:
+                mx.async_eval(drafts, q_rows, cand)
+        return drafts, q_rows, cand
 
 
 def baseline_generate(
@@ -293,6 +378,48 @@ def _load_tokenizer_eos(tokenizer) -> set[int]:
     return {int(eos_id)} if eos_id is not None else set()
 
 
+def _chat(target: TargetAdapter, draft, tokenizer, args) -> None:
+    """Multi-turn chat. The whole conversation is sent each turn, as a chat or
+    agent client does; with the prompt cache on, the target reads only what is
+    new."""
+    target.enable_prompt_cache(True, ctx_rows=draft.config.sliding_window)
+    gen = DSpineGenerator(
+        target, draft, block_size=args.block_size, copy=args.copy, copy_min=args.copy_min
+    )
+    stop_ids = _load_tokenizer_eos(tokenizer)
+    messages = []
+    print("[dspine] chat: an empty line or Ctrl-D ends")
+    while True:
+        try:
+            user = input(">>> ").strip()
+        except EOFError:
+            break
+        if not user:
+            break
+        messages.append({"role": "user", "content": user})
+        prompt = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, enable_thinking=False
+        )
+        tokens, stats = gen.generate(
+            prompt,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            min_p=args.min_p,
+            stop_ids=stop_ids,
+        )
+        text = tokenizer.decode([t for t in tokens if t not in stop_ids])
+        print(text)
+        print(
+            f"[dspine] prompt={len(prompt)} reused={target.last_reused} "
+            f"prefill={stats.prefill_seconds:.2f}s tokens={stats.generated_tokens} "
+            f"decode={stats.decode_tps:.2f} tok/s"
+        )
+        messages.append({"role": "assistant", "content": text})
+        mx.clear_cache()
+
+
 def main() -> None:
     p = argparse.ArgumentParser("dspine-generate")
     p.add_argument("--target", required=True)
@@ -312,6 +439,19 @@ def main() -> None:
     p.add_argument("--draft-q-mode", default="affine")
     p.add_argument("--profile", action="store_true")
     p.add_argument("--baseline", action="store_true")
+    p.add_argument(
+        "--copy",
+        action="store_true",
+        help="propose a copy from the context instead of running the draft when the last "
+        "--copy-min tokens occur earlier (code edits, quoting); the output does not change",
+    )
+    p.add_argument("--copy-min", type=int, default=12)
+    p.add_argument(
+        "--chat",
+        action="store_true",
+        help="multi-turn chat on stdin; the target cache is kept between turns, "
+        "so each turn prefills only the new part of the conversation",
+    )
     args = p.parse_args()
 
     mx.random.seed(args.seed)
@@ -327,6 +467,8 @@ def main() -> None:
     draft.bind(target.model)
     tokenizer = target.tokenizer
 
+    if args.chat:
+        return _chat(target, draft, tokenizer, args)
     if args.raw:
         prompt = tokenizer.encode(args.prompt, add_special_tokens=True)
     else:
@@ -337,7 +479,12 @@ def main() -> None:
         )
     stop_ids = _load_tokenizer_eos(tokenizer)
     gen = DSpineGenerator(
-        target, draft, block_size=args.block_size, profile=args.profile
+        target,
+        draft,
+        block_size=args.block_size,
+        profile=args.profile,
+        copy=args.copy,
+        copy_min=args.copy_min,
     )
     print(f"[tables] {gen.tables_seconds:.2f}s")
     tokens, stats = gen.generate(
@@ -353,7 +500,7 @@ def main() -> None:
     print(
         f"[dspine] block={stats.block_size} tokens={stats.generated_tokens} "
         f"rounds={stats.rounds} accept/round={stats.accepted_per_round:.2f} "
-        f"tokens/round={stats.tokens_per_round:.2f} "
+        f"tokens/round={stats.tokens_per_round:.2f} copy_rounds={stats.copy_rounds} "
         f"decode={stats.decode_tps:.2f} tok/s "
         f"prefill={stats.prefill_seconds:.2f}s "
         f"peak={stats.peak_memory_gb:.1f}GB"
