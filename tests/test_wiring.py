@@ -302,3 +302,50 @@ def test_sampling_memory_witness_stages_synthetic_q_and_restores_live_state(fail
             assert DSpineWorkerV2._measure_sampling_peak(worker, candidates=torch.zeros(bs, width), target_logits=torch.zeros(bs * width, 3), sampling_info=None)==0
     assert sampler._round_bs == 3 and not sampler._round_sampled
     assert torch.equal(sampler.candidate_out, saved_ids) and torch.equal(sampler.q_out, saved_q)
+
+
+@pytest.mark.parametrize("with_caps", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_forward_batch_generation_clears_premature_shared_read_done_event(
+    with_caps, fail
+):
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    events = []
+    runner = types.SimpleNamespace(shared_read_done_event=None)
+    worker = _worker(types.SimpleNamespace(optimized=False), 8)
+    worker._target_worker = types.SimpleNamespace(model_runner=runner)
+    worker._dspine_tp = None
+    assert worker.last_shared_read_runner is runner
+    if with_caps:
+        worker.verify_caps = types.SimpleNamespace(
+            begin=lambda batch: events.append(("begin", batch)),
+            finish=lambda: events.append(("finish", runner.shared_read_done_event)),
+        )
+    sentinel_event = object()
+    sentinel_result = object()
+    batch = types.SimpleNamespace(
+        sampling_info=None,
+        forward_mode=types.SimpleNamespace(is_decode=lambda: True),
+    )
+
+    def fake_super_forward(self, *args, **kwargs):
+        # Target verify graph replay publishes in_graph_metadata_prep_done before
+        # post-verify ReplaySSM commit and draft KV append run on forward_stream.
+        runner.shared_read_done_event = sentinel_event
+        if fail:
+            raise RuntimeError("boom")
+        return sentinel_result
+
+    with mock.patch.object(
+        DFlashWorkerV2, "forward_batch_generation", fake_super_forward
+    ):
+        if fail:
+            with pytest.raises(RuntimeError, match="boom"):
+                worker.forward_batch_generation(batch)
+        else:
+            assert worker.forward_batch_generation(batch) is sentinel_result
+
+    assert runner.shared_read_done_event is None
+    if with_caps:
+        assert [tag for tag, _ in events] == ["begin", "finish"]

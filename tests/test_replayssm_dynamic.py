@@ -102,3 +102,68 @@ def test_live_cursor_guard_checks_all_rows(bs):
     launch(torch, requests, mapping, wp, flags, counts, bs=bs, state_slots=bs)
     torch.cuda.synchronize()
     assert counts[bs].item() == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_replayssm_commit_and_slot_reset_preserve_wp0_with_stream_barrier():
+    from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+        commit_gdn_replayssm_circular,
+        commit_gdn_replayssm_spec,
+    )
+    from sglang_dspine.runtime.replayssm.guard import launch
+
+    device = "cuda"
+    layers, hv, h, v, k, ring, bs, slots = 4, 6, 2, 64, 64, 16, 4, 8
+    ckpt = torch.zeros((layers, slots, hv, v, k), dtype=torch.float32, device=device)
+    d_cache = torch.zeros((layers, slots, hv, ring, v), dtype=torch.bfloat16, device=device)
+    k_cache = torch.zeros((layers, slots, h, ring, k), dtype=torch.bfloat16, device=device)
+    g_cache = torch.zeros((layers, slots, hv, ring), dtype=torch.float32, device=device)
+    wp = torch.zeros(slots, dtype=torch.int32, device=device)
+    cb = torch.zeros(slots, dtype=torch.int32, device=device)
+    flags = torch.zeros(slots, dtype=torch.int8, device=device)
+    counts = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+    requests = torch.arange(bs, dtype=torch.int64, device=device)
+    mapping = torch.arange(slots, dtype=torch.int32, device=device)
+    accept_lens = torch.full((bs,), 5, dtype=torch.int32, device=device)
+
+    fwd_stream = torch.cuda.Stream()
+    sched_stream = torch.cuda.Stream()
+    for _ in range(32):
+        with torch.cuda.stream(fwd_stream):
+            fwd_stream.wait_stream(sched_stream)
+            launch(torch, requests, mapping, wp, flags, counts, bs=bs, state_slots=slots)
+            commit_gdn_replayssm_spec(
+                write_pos=wp,
+                cache_base=cb,
+                is_flush=flags,
+                num_accepted=accept_lens,
+                replay_indices=requests,
+                max_cache_len=ring,
+                max_spec_len=8,
+                fold_every_commit=False,
+                null_block_id=-1,
+            )
+            commit_gdn_replayssm_circular(
+                checkpoint_state=ckpt,
+                d_cache=d_cache,
+                k_cache=k_cache,
+                g_cache=g_cache,
+                d_residual_cache=None,
+                k_residual_cache=None,
+                state_batch_indices=mapping[:bs],
+                replay_indices=requests,
+                write_pos=wp,
+                cache_base=cb,
+                is_flush=flags,
+                accept_lens=accept_lens,
+                null_block_id=-1,
+            )
+        sched_stream.wait_stream(fwd_stream)
+        with torch.cuda.stream(sched_stream):
+            wp[[0]] = 0
+            cb[[0]] = 0
+            flags[[0]] = 0
+    torch.cuda.synchronize()
+    assert counts[bs].item() == 32
+    assert wp[:bs].tolist() == [0] * bs
+    assert flags[:bs].tolist() == [0] * bs

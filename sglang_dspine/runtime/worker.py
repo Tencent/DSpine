@@ -723,6 +723,24 @@ class DSpineWorkerV2(DFlashWorkerV2):
             commit_lens=commit_lens,
         )
 
+    def _clear_premature_shared_read_done(self) -> None:
+        """Force the overlap WAR barrier to fence behind post-verify pool ops.
+
+        Target verify publishes ``in_graph_metadata_prep_done`` at layer 0,
+        before GDN ReplaySSM layers, ``commit_gdn_replay``, and draft-KV
+        materialization finish accessing request-slot pools on forward_stream.
+        Clearing the event makes SGLang's ``_apply_war_barrier()`` fall back to
+        ``schedule_stream.wait_stream(forward_stream)``.
+        """
+        if "_target_worker" not in self.__dict__ and "target_worker" not in self.__dict__:
+            return
+        for runner in (
+            getattr(self, "last_shared_read_runner", None),
+            getattr(getattr(self, "target_worker", None), "model_runner", None),
+        ):
+            if runner is not None and hasattr(runner, "shared_read_done_event"):
+                runner.shared_read_done_event = None
+
     def forward_batch_generation(self, *args, **kwargs):
         controller = getattr(self, "verify_caps", None)
         batch = kwargs.get("batch", args[0] if args else None)
@@ -733,14 +751,17 @@ class DSpineWorkerV2(DFlashWorkerV2):
             and batch.forward_mode.is_decode()
         ):
             raise RuntimeError("Requested DSPine verify caps were not initialized")
-        with seeded_batch(batch, getattr(self, "_dspine_tp", None)):
-            if controller is None:
-                return super().forward_batch_generation(*args, **kwargs)
-            controller.begin(batch)
-            try:
-                return super().forward_batch_generation(*args, **kwargs)
-            finally:
-                controller.finish()
+        try:
+            with seeded_batch(batch, getattr(self, "_dspine_tp", None)):
+                if controller is None:
+                    return super().forward_batch_generation(*args, **kwargs)
+                controller.begin(batch)
+                try:
+                    return super().forward_batch_generation(*args, **kwargs)
+                finally:
+                    controller.finish()
+        finally:
+            self._clear_premature_shared_read_done()
 
     def _accept_block(self, **kwargs):
         controller = getattr(self, "verify_caps", None)
